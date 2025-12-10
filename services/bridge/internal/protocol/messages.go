@@ -27,6 +27,7 @@ const (
 	TypeProcessKill       = "process_kill"
 	TypeProcessKilled     = "process_killed"
 	TypeProcessUpdated    = "process_updated"
+	TypeProcessReattach   = "process_reattach"
 
 	// Claude Conversion
 	TypeClaudeStart = "claude_start"
@@ -36,6 +37,12 @@ const (
 	TypePtyInput  = "pty_input"
 	TypePtyOutput = "pty_output"
 	TypePtyResize = "pty_resize"
+
+	// PTY History
+	TypePtyHistoryRequest  = "pty_history_request"
+	TypePtyHistoryResponse = "pty_history_response"
+	TypePtyHistoryChunk    = "pty_history_chunk"
+	TypePtyHistoryComplete = "pty_history_complete"
 
 	// Chat (AgentAPI)
 	TypeChatSubscribe    = "chat_subscribe"
@@ -58,9 +65,10 @@ func AllMessageTypes() []string {
 		TypeAuth, TypeAuthResult,
 		TypeHostConnect, TypeHostDisconnect, TypeHostStatus, TypeHostCheckRequirements, TypeHostRequirementsResult,
 		TypeProcessList, TypeProcessListResult, TypeProcessCreate, TypeProcessCreated,
-		TypeProcessSelect, TypeProcessKill, TypeProcessKilled, TypeProcessUpdated,
+		TypeProcessSelect, TypeProcessKill, TypeProcessKilled, TypeProcessUpdated, TypeProcessReattach,
 		TypeClaudeStart, TypeClaudeKill,
 		TypePtyInput, TypePtyOutput, TypePtyResize,
+		TypePtyHistoryRequest, TypePtyHistoryResponse, TypePtyHistoryChunk, TypePtyHistoryComplete,
 		TypeChatSubscribe, TypeChatUnsubscribe, TypeChatSend, TypeChatRaw,
 		TypeChatEvent, TypeChatStatus, TypeChatStatusResult, TypeChatHistory, TypeChatMessages,
 		TypeError,
@@ -116,10 +124,14 @@ type ProcessInfo struct {
 	AgentAPIPID   *int        `json:"agentApiPid,omitempty"`
 }
 
-// StaleProcess represents a detected but not connectable process
+// StaleProcess represents a detected but not connected process
+// Can be either an orphaned AgentAPI port or a detached tmux session
 type StaleProcess struct {
-	Port   int    `json:"port"`
-	Reason string `json:"reason"`
+	Port        int     `json:"port,omitempty"`        // AgentAPI port (if applicable)
+	Reason      string  `json:"reason"`                // "connection_refused", "timeout", "detached"
+	TmuxSession *string `json:"tmuxSession,omitempty"` // tmux session name (for reattach)
+	ProcessID   *string `json:"processId,omitempty"`   // Process ID extracted from tmux name
+	StartedAt   *string `json:"startedAt,omitempty"`   // When the session was created
 }
 
 // ============================================================================
@@ -220,6 +232,12 @@ type ProcessKilledPayload struct {
 	ProcessID string `json:"processId"`
 }
 
+type ProcessReattachPayload struct {
+	HostID      string `json:"hostId"`
+	TmuxSession string `json:"tmuxSession"`
+	ProcessID   string `json:"processId"` // Original process ID from tmux session name
+}
+
 type ProcessUpdatedPayload struct {
 	ID            string      `json:"id"`
 	Type          ProcessType `json:"type"`
@@ -260,6 +278,34 @@ type PtyResizePayload struct {
 	ProcessID string `json:"processId"`
 	Cols      int    `json:"cols"`
 	Rows      int    `json:"rows"`
+}
+
+// ============================================================================
+// PTY History Payloads
+// ============================================================================
+
+type PtyHistoryRequestPayload struct {
+	ProcessID string `json:"processId"`
+}
+
+type PtyHistoryResponsePayload struct {
+	ProcessID  string `json:"processId"`
+	TotalSize  int64  `json:"totalSize"`
+	Compressed bool   `json:"compressed"`
+}
+
+type PtyHistoryChunkPayload struct {
+	ProcessID   string `json:"processId"`
+	Data        string `json:"data"` // Base64 encoded
+	ChunkIndex  int    `json:"chunkIndex"`
+	TotalChunks int    `json:"totalChunks"`
+	IsLast      bool   `json:"isLast"`
+}
+
+type PtyHistoryCompletePayload struct {
+	ProcessID string  `json:"processId"`
+	Success   bool    `json:"success"`
+	Error     *string `json:"error,omitempty"`
 }
 
 // ============================================================================

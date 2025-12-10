@@ -4,7 +4,7 @@ import { useFonts } from 'expo-font';
 import { Stack } from 'expo-router';
 import * as SplashScreen from 'expo-splash-screen';
 import { useEffect } from 'react';
-import { View, Platform } from 'react-native';
+import { View } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import 'react-native-reanimated';
 
@@ -12,8 +12,8 @@ import { useColorScheme } from '@/components/useColorScheme';
 import { ThemeProvider } from '@/providers/ThemeProvider';
 import { BridgeProvider } from '@/providers/BridgeProvider';
 import { ToastContainer } from '@/components/common';
-import { useToastStore, useSettingsStore, selectBridgeUrl } from '@/stores';
-import { useConnectionToasts, usePtyOutputHandler } from '@/hooks';
+import { useToastStore, useSettingsStore, selectBridgeUrl, selectBridgeAutoConnect } from '@/stores';
+import { useConnectionToasts } from '@/hooks';
 import { useShallow } from 'zustand/react/shallow';
 
 export {
@@ -35,8 +35,9 @@ export default function RootLayout() {
     ...FontAwesome.font,
   });
 
-  // Get bridge URL from settings store
+  // Get bridge settings from store
   const bridgeUrl = useSettingsStore(selectBridgeUrl);
+  const bridgeAutoConnect = useSettingsStore(selectBridgeAutoConnect);
 
   // Expo Router uses Error Boundaries to catch errors in the navigation tree.
   useEffect(() => {
@@ -56,7 +57,7 @@ export default function RootLayout() {
   return (
     <SafeAreaProvider>
       <ThemeProvider>
-        <BridgeProvider autoConnect defaultUrl={bridgeUrl}>
+        <BridgeProvider autoConnect={bridgeAutoConnect} defaultUrl={bridgeUrl}>
           <RootLayoutNav />
         </BridgeProvider>
       </ThemeProvider>
@@ -70,10 +71,6 @@ function ToastOverlay() {
 
   // Show toasts for connection state changes
   useConnectionToasts();
-
-  // Global PTY output handler - only used on web to capture output when terminal tab is not active
-  // On native, TerminalView handles its own PTY output to avoid double-appending
-  usePtyOutputHandler({ enabled: Platform.OS === 'web' });
 
   return <ToastContainer toasts={toasts} onDismiss={removeToast} />;
 }

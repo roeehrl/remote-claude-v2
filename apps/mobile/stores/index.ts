@@ -4,6 +4,7 @@ export {
   getHostCredential,
   deleteHostCredential,
   selectBridgeUrl,
+  selectBridgeAutoConnect,
   selectHosts,
   selectFontSize,
   selectHostById,
@@ -11,38 +12,6 @@ export {
   type AuthType,
   type SettingsState,
 } from './settingsStore';
-
-export {
-  useHostStore,
-  selectConnectedHosts,
-  selectHostById as selectConnectedHostById,
-  selectSelectedProcess,
-  selectSelectedProcessId,
-  selectAllProcesses,
-  selectHostsMap,
-  type ConnectedHost,
-  type HostConnectionState,
-  type HostStoreState,
-} from './hostStore';
-
-export {
-  useTerminalStore,
-  selectBuffer,
-  selectBufferLines,
-  type TerminalBuffer,
-  type TerminalStoreState,
-} from './terminalStore';
-
-export {
-  useChatStore,
-  selectSession,
-  selectMessages,
-  selectStatus,
-  selectIsSubscribed,
-  type AgentStatus,
-  type ChatSession,
-  type ChatStoreState,
-} from './chatStore';
 
 export {
   useToastStore,

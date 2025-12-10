@@ -343,6 +343,8 @@ export default function SettingsScreen() {
   const {
     bridgeUrl,
     setBridgeUrl,
+    bridgeAutoConnect,
+    setBridgeAutoConnect,
     hosts,
     addHost,
     updateHost,
@@ -447,6 +449,17 @@ export default function SettingsScreen() {
               }}
             />
           )}
+          <SettingsRow
+            label="Auto-connect on Start"
+            rightElement={
+              <Switch
+                value={bridgeAutoConnect}
+                onValueChange={setBridgeAutoConnect}
+                trackColor={{ false: colors.border, true: colors.primary }}
+                thumbColor={Platform.OS === 'android' ? (bridgeAutoConnect ? colors.primary : '#f4f3f4') : undefined}
+              />
+            }
+          />
         </View>
 
         {/* SSH Hosts Section */}

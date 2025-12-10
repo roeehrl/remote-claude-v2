@@ -1,13 +1,11 @@
 import React, { useMemo, useCallback } from 'react';
 import { StyleSheet, View, Pressable, Platform, Alert, KeyboardAvoidingView } from 'react-native';
-import { useShallow } from 'zustand/react/shallow';
 import { Text } from '@/components/Themed';
 import { TerminalView } from '@/components/terminal';
 // Only import TerminalInputBar for web - native uses xterm.js which handles input directly
 import { TerminalInputBar } from '@/components/terminal';
 import { useThemeColors } from '@/providers/ThemeProvider';
 import { useBridge, useConnectionState } from '@/providers/BridgeProvider';
-import { useHostStore, selectSelectedProcessId, selectHostsMap } from '@/stores';
 import { ProcessInfo, Messages } from '@remote-claude/shared-types';
 import { Ionicons } from '@expo/vector-icons';
 
@@ -17,13 +15,8 @@ import { Ionicons } from '@expo/vector-icons';
 
 export default function TerminalScreen() {
   const colors = useThemeColors();
-  const { sendMessage } = useBridge();
+  const { sendMessage, hosts: hostsMap, selectedProcessId, selectProcess } = useBridge();
   const { connectionState } = useConnectionState();
-
-  // Host store - use useShallow for Map to prevent infinite re-renders
-  const hostsMap = useHostStore(useShallow(selectHostsMap));
-  const selectedProcessId = useHostStore(selectSelectedProcessId);
-  const { selectProcess } = useHostStore();
 
   // Derive selected process and all processes from hostsMap
   const selectedProcess = useMemo(() => {
@@ -236,13 +229,12 @@ export default function TerminalScreen() {
   // Main Terminal View
   // ============================================================================
 
-  // On native, xterm.js handles input directly via the DOM component
-  // On web, we also use xterm.js directly, so no input bar needed there either
-  // But keep the input bar as an option for web if keyboard access is limited
-  const showInputBar = Platform.OS === 'web';
-
   return (
-    <View style={[styles.container, { backgroundColor: colors.background }]}>
+    <KeyboardAvoidingView
+      style={[styles.container, { backgroundColor: colors.background }]}
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      keyboardVerticalOffset={Platform.OS === 'ios' ? 90 : 0}
+    >
       {renderProcessSelector()}
       {renderActionBar()}
 
@@ -250,17 +242,9 @@ export default function TerminalScreen() {
         <TerminalView processId={selectedProcess.id} />
       </View>
 
-      {/* Quick action bar for control keys - only on web where direct keyboard might be limited */}
-      {showInputBar && (
-        <KeyboardAvoidingView
-          behavior="padding"
-          keyboardVerticalOffset={Platform.OS === 'ios' ? 90 : 24}
-          style={styles.inputBarContainer}
-        >
-          <TerminalInputBar processId={selectedProcess.id} />
-        </KeyboardAvoidingView>
-      )}
-    </View>
+      {/* Input bar with quick actions for control keys */}
+      <TerminalInputBar processId={selectedProcess.id} />
+    </KeyboardAvoidingView>
   );
 }
 
@@ -354,9 +338,6 @@ const styles = StyleSheet.create({
     flex: 1,
     overflow: 'hidden', // Ensure terminal content doesn't overflow into input bar
     minHeight: 0, // Allow flex item to shrink below content size (important for web)
-  },
-  inputBarContainer: {
-    flexShrink: 0, // Never shrink the input bar
   },
   emptyState: {
     flex: 1,

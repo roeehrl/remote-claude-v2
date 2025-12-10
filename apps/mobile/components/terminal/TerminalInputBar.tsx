@@ -1,5 +1,6 @@
 import React, { useState, useCallback } from 'react';
-import { StyleSheet, Pressable, View as RNView, TextInput, ScrollView } from 'react-native';
+import { StyleSheet, Pressable, View as RNView, TextInput, ScrollView, Platform } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Text } from '@/components/Themed';
 import { useThemeColors } from '@/providers/ThemeProvider';
 import { useBridge } from '@/providers/BridgeProvider';
@@ -47,6 +48,10 @@ export function TerminalInputBar({ processId }: TerminalInputBarProps) {
   const { sendMessage } = useBridge();
   const fontSize = useSettingsStore(selectFontSize);
   const [inputText, setInputText] = useState('');
+  const insets = useSafeAreaInsets();
+
+  // Add bottom safe area padding on native (for home indicator)
+  const bottomPadding = Platform.OS !== 'web' ? Math.max(insets.bottom, 8) : 8;
 
   const sendInput = useCallback((data: string) => {
     sendMessage(Messages.ptyInput({ processId, data }));
@@ -67,7 +72,7 @@ export function TerminalInputBar({ processId }: TerminalInputBarProps) {
   }, [inputText, sendInput]);
 
   return (
-    <RNView style={[styles.container, { backgroundColor: colors.backgroundSecondary, borderTopColor: colors.border }]}>
+    <RNView style={[styles.container, { backgroundColor: colors.backgroundSecondary, borderTopColor: colors.border, paddingBottom: bottomPadding }]}>
       {/* Command input row */}
       <RNView style={styles.inputRow}>
         <Text style={[styles.prompt, { color: colors.primary }]}>$</Text>
@@ -128,7 +133,7 @@ export function TerminalInputBar({ processId }: TerminalInputBarProps) {
 const styles = StyleSheet.create({
   container: {
     borderTopWidth: 1,
-    paddingVertical: 8,
+    paddingTop: 8,
     paddingHorizontal: 12,
     gap: 8,
     flexShrink: 0, // Never shrink - always show full input bar

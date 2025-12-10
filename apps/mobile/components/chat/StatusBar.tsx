@@ -2,12 +2,13 @@ import React from 'react';
 import { StyleSheet, View as RNView, ActivityIndicator } from 'react-native';
 import { Text } from '@/components/Themed';
 import { useThemeColors } from '@/providers/ThemeProvider';
-import { AgentStatus } from '@/stores/chatStore';
 import { Ionicons } from '@expo/vector-icons';
 
 // ============================================================================
 // Types
 // ============================================================================
+
+type AgentStatus = 'running' | 'stable' | 'disconnected';
 
 interface StatusBarProps {
   status: AgentStatus;

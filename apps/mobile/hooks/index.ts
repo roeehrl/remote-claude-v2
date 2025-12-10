@@ -1,5 +1,4 @@
 export { useConnectionToasts } from './useConnectionToasts';
-export { usePtyOutputHandler } from './usePtyOutputHandler';
 export {
   useResponsiveLayout,
   getLayoutForWidth,

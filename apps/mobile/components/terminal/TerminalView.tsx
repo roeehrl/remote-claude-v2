@@ -1,20 +1,25 @@
-import React, { useRef, useEffect, useCallback, useMemo } from 'react';
+import React, { useRef, useEffect, useCallback, useMemo, useState } from 'react';
 import {
   StyleSheet,
   FlatList,
   View,
   ListRenderItem,
+  ActivityIndicator,
 } from 'react-native';
 import { Text } from '@/components/Themed';
 import { TerminalLine } from './TerminalLine';
 import { useTheme, useThemeColors } from '@/providers/ThemeProvider';
-import { useMessageHandler } from '@/providers/BridgeProvider';
-import { useTerminalStore, useSettingsStore, selectFontSize, selectBufferLines } from '@/stores';
+import { useBridge, useMessageHandler } from '@/providers/BridgeProvider';
+import { useSettingsStore, selectFontSize } from '@/stores';
 import { AnsiParser, ParsedLine } from '@/lib/ansi';
 import {
   Message,
+  Messages,
   MessageTypes,
   PtyOutputPayload,
+  PtyHistoryResponsePayload,
+  PtyHistoryChunkPayload,
+  PtyHistoryCompletePayload,
 } from '@remote-claude/shared-types';
 
 // ============================================================================
@@ -40,32 +45,48 @@ export function TerminalView({ processId, onReady }: TerminalViewProps) {
   const parserRef = useRef<AnsiParser | null>(null);
   const lastLineCountRef = useRef(0);
   const initialScrollDone = useRef(false);
-  const clearedRef = useRef<string | null>(null);
+  const loadingProcessIdRef = useRef<string | null>(null);
+
+  // LOCAL STATE - no global store, component is completely stateless
+  const [rawOutput, setRawOutput] = useState('');
+  const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const [historyLoaded, setHistoryLoaded] = useState(false);
+  const chunksRef = useRef<string[]>([]);
 
   const { isDarkMode } = useTheme();
   const colors = useThemeColors();
   const fontSize = useSettingsStore(selectFontSize);
+  const { sendMessage } = useBridge();
 
-  const appendOutput = useTerminalStore(state => state.appendOutput);
-  const clearBuffer = useTerminalStore(state => state.clearBuffer);
-
-  // Memoize the selector to avoid creating new function references
-  const bufferLinesSelector = useMemo(() => selectBufferLines(processId), [processId]);
-  const bufferLines = useTerminalStore(bufferLinesSelector);
+  // Derive lines from raw output
+  const bufferLines = useMemo(() => {
+    if (!rawOutput) return [];
+    return rawOutput.split('\n');
+  }, [rawOutput]);
 
   // ============================================================================
-  // Initialize parser and clear buffer on mount (once per processId)
+  // Request history on mount / process change
   // ============================================================================
 
   useEffect(() => {
     parserRef.current = new AnsiParser(isDarkMode);
-    // Clear any stale buffer data on mount to start fresh (only once per processId)
-    if (clearedRef.current !== processId) {
-      clearedRef.current = processId;
-      clearBuffer(processId);
+
+    // Reset local state for new process
+    setRawOutput('');
+    setHistoryLoaded(false);
+    chunksRef.current = [];
+    initialScrollDone.current = false;
+    lastLineCountRef.current = 0;
+
+    // Request history from bridge
+    if (loadingProcessIdRef.current !== processId) {
+      loadingProcessIdRef.current = processId;
+      setIsLoadingHistory(true);
+      sendMessage(Messages.ptyHistoryRequest({ processId }));
     }
+
     onReady?.();
-  }, [processId]);
+  }, [processId, sendMessage]);
 
   // Update parser dark mode
   useEffect(() => {
@@ -130,17 +151,75 @@ export function TerminalView({ processId, onReady }: TerminalViewProps) {
   }, [scrollToBottom]);
 
   // ============================================================================
-  // Handle PTY output
+  // Handle PTY history response (metadata)
+  // ============================================================================
+
+  useMessageHandler<PtyHistoryResponsePayload>(
+    MessageTypes.PTY_HISTORY_RESPONSE,
+    useCallback((msg: Message<PtyHistoryResponsePayload>) => {
+      if (msg.payload.processId === processId) {
+        // Reset chunks for new history load
+        chunksRef.current = [];
+      }
+    }, [processId]),
+    [processId]
+  );
+
+  // ============================================================================
+  // Handle PTY history chunks
+  // ============================================================================
+
+  useMessageHandler<PtyHistoryChunkPayload>(
+    MessageTypes.PTY_HISTORY_CHUNK,
+    useCallback((msg: Message<PtyHistoryChunkPayload>) => {
+      if (msg.payload.processId === processId) {
+        // Decode base64 chunk and store
+        try {
+          const decoded = atob(msg.payload.data);
+          chunksRef.current.push(decoded);
+
+          // Progressive rendering: update display as chunks arrive
+          setRawOutput(chunksRef.current.join(''));
+        } catch (err) {
+          console.error('Failed to decode PTY history chunk:', err);
+        }
+      }
+    }, [processId]),
+    [processId]
+  );
+
+  // ============================================================================
+  // Handle PTY history complete
+  // ============================================================================
+
+  useMessageHandler<PtyHistoryCompletePayload>(
+    MessageTypes.PTY_HISTORY_COMPLETE,
+    useCallback((msg: Message<PtyHistoryCompletePayload>) => {
+      if (msg.payload.processId === processId) {
+        setIsLoadingHistory(false);
+        setHistoryLoaded(true);
+
+        if (!msg.payload.success) {
+          console.error('PTY history load failed:', msg.payload.error);
+        }
+      }
+    }, [processId]),
+    [processId]
+  );
+
+  // ============================================================================
+  // Handle live PTY output (appends to local state)
   // ============================================================================
 
   useMessageHandler<PtyOutputPayload>(
     MessageTypes.PTY_OUTPUT,
     useCallback((msg: Message<PtyOutputPayload>) => {
       if (msg.payload.processId === processId) {
-        appendOutput(processId, msg.payload.data);
+        // Append to local state (not global store)
+        setRawOutput(prev => prev + msg.payload.data);
       }
-    }, [processId, appendOutput]),
-    [processId, appendOutput]
+    }, [processId]),
+    [processId]
   );
 
   // ============================================================================
@@ -192,9 +271,18 @@ export function TerminalView({ processId, onReady }: TerminalViewProps) {
         }}
         ListEmptyComponent={
           <View style={styles.emptyContainer}>
-            <Text style={[styles.emptyText, { color: colors.terminalText }]}>
-              Terminal connected. Waiting for output...
-            </Text>
+            {isLoadingHistory ? (
+              <>
+                <ActivityIndicator size="small" color={colors.terminalText} />
+                <Text style={[styles.emptyText, { color: colors.terminalText, marginTop: 8 }]}>
+                  Loading terminal history...
+                </Text>
+              </>
+            ) : (
+              <Text style={[styles.emptyText, { color: colors.terminalText }]}>
+                Terminal connected. Waiting for output...
+              </Text>
+            )}
           </View>
         }
       />

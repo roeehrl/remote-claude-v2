@@ -3,14 +3,13 @@ import { View, StyleSheet, Text, Pressable, Platform, Alert, ActionSheetIOS } fr
 import FontAwesome from '@expo/vector-icons/FontAwesome';
 import { Ionicons } from '@expo/vector-icons';
 import { Tabs, usePathname, useRouter } from 'expo-router';
-import { useShallow } from 'zustand/react/shallow';
 
 import { useThemeColors } from '@/providers/ThemeProvider';
 import { useClientOnlyValue } from '@/components/useClientOnlyValue';
 import { useResponsiveLayout } from '@/hooks/useResponsiveLayout';
 import { Sidebar, SidebarItem, COLLAPSED_SIDEBAR_WIDTH } from '@/components/layout/Sidebar';
 import { useBridge } from '@/providers/BridgeProvider';
-import { useHostStore, useSettingsStore, selectHosts } from '@/stores';
+import { useSettingsStore, selectHosts } from '@/stores';
 import { Messages } from '@remote-claude/shared-types';
 
 // ============================================================================
@@ -49,9 +48,8 @@ function routeToKey(pathname: string): string {
 
 function NewShellButton() {
   const colors = useThemeColors();
-  const { sendMessage } = useBridge();
+  const { sendMessage, hosts: hostsMap } = useBridge();
   const hosts = useSettingsStore(selectHosts);
-  const hostsMap = useHostStore(useShallow(state => state.hosts));
 
   // Get connected hosts
   const connectedHosts = useMemo(() => {

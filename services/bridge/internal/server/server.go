@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"path/filepath"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,17 +17,20 @@ import (
 	"github.com/roeeharel/remote-claude-v2/services/bridge/internal/scanner"
 	"github.com/roeeharel/remote-claude-v2/services/bridge/internal/session"
 	"github.com/roeeharel/remote-claude-v2/services/bridge/internal/ssh"
+	"github.com/roeeharel/remote-claude-v2/services/bridge/internal/storage"
 	cryptossh "golang.org/x/crypto/ssh"
 )
 
 // Server represents the Bridge WebSocket server
 type Server struct {
 	addr            string
+	dataDir         string
 	upgrader        websocket.Upgrader
 	sessionManager  *session.Manager
 	sshManager      *ssh.Manager
 	processRegistry *process.Registry
 	portScanner     *scanner.Scanner
+	storage         *storage.Store
 	handlers        map[string]MessageHandler
 }
 
@@ -40,9 +44,17 @@ type ConnectedSession struct {
 }
 
 // New creates a new Bridge server
-func New(addr string) *Server {
+func New(addr string, dataDir string) (*Server, error) {
+	// Initialize storage
+	dbPath := filepath.Join(dataDir, "bridge.db")
+	store, err := storage.NewStore(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize storage: %w", err)
+	}
+
 	s := &Server{
-		addr: addr,
+		addr:    addr,
+		dataDir: dataDir,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				// Allow all origins in development
@@ -54,20 +66,32 @@ func New(addr string) *Server {
 		sshManager:      ssh.NewManager(),
 		processRegistry: process.NewRegistry(),
 		portScanner:     scanner.NewScanner(),
+		storage:         store,
 		handlers:        make(map[string]MessageHandler),
 	}
 
 	// Register message handlers
 	s.registerHandlers()
 
-	return s
+	return s, nil
 }
 
 // Stop gracefully shuts down the server
 func (s *Server) Stop() {
+	log.Printf("[INFO] [SERVER] Shutting down...")
+
+	// Close storage first (persists all data)
+	if s.storage != nil {
+		if err := s.storage.Close(); err != nil {
+			log.Printf("[WARN] [SERVER] Error closing storage: %v", err)
+		}
+	}
+
 	s.processRegistry.Close()
 	s.sshManager.Close()
 	s.sessionManager.Stop()
+
+	log.Printf("[INFO] [SERVER] Shutdown complete")
 }
 
 // registerHandlers sets up message type handlers
@@ -80,10 +104,12 @@ func (s *Server) registerHandlers() {
 	s.handlers[protocol.TypeProcessCreate] = s.handleProcessCreate
 	s.handlers[protocol.TypeProcessKill] = s.handleProcessKill
 	s.handlers[protocol.TypeProcessSelect] = s.handleProcessSelect
+	s.handlers[protocol.TypeProcessReattach] = s.handleProcessReattach
 	s.handlers[protocol.TypeClaudeStart] = s.handleClaudeStart
 	s.handlers[protocol.TypeClaudeKill] = s.handleClaudeKill
 	s.handlers[protocol.TypePtyInput] = s.handlePtyInput
 	s.handlers[protocol.TypePtyResize] = s.handlePtyResize
+	s.handlers[protocol.TypePtyHistoryRequest] = s.handlePtyHistoryRequest
 	s.handlers[protocol.TypeChatSubscribe] = s.handleChatSubscribe
 	s.handlers[protocol.TypeChatUnsubscribe] = s.handleChatUnsubscribe
 	s.handlers[protocol.TypeChatSend] = s.handleChatSend
@@ -269,7 +295,55 @@ func (s *Server) handleAuth(connSession *ConnectedSession, msg *protocol.Message
 		return err
 	}
 
-	return finalSession.Send(response)
+	if err := finalSession.Send(response); err != nil {
+		return err
+	}
+
+	// Send current state of all connected hosts
+	// This ensures frontend knows what's already connected after app restart
+	s.sendCurrentHostStates(finalSession)
+
+	return nil
+}
+
+// sendCurrentHostStates sends HOST_STATUS for all connected SSH hosts
+func (s *Server) sendCurrentHostStates(session *ConnectedSession) {
+	connectedHosts := s.sshManager.GetAllConnections()
+	for _, hostID := range connectedHosts {
+		// Get processes for this host from process registry
+		processes := s.processRegistry.GetByHost(hostID)
+		processInfos := make([]protocol.ProcessInfo, 0, len(processes))
+		for _, proc := range processes {
+			processInfos = append(processInfos, protocol.ProcessInfo{
+				ID:            proc.ID,
+				Type:          protocol.ProcessType(proc.Type),
+				HostID:        proc.HostID,
+				CWD:           proc.CWD,
+				Port:          proc.Port,
+				PtyReady:      proc.PtyReady,
+				AgentAPIReady: proc.AgentAPIReady,
+				ShellPID:      proc.ShellPID,
+				AgentAPIPID:   proc.AgentAPIPID,
+				StartedAt:     proc.StartedAt.Format("2006-01-02T15:04:05Z07:00"),
+			})
+		}
+
+		msg, err := protocol.NewMessage(protocol.TypeHostStatus, protocol.HostStatusPayload{
+			HostID:    hostID,
+			Connected: true,
+			Processes: processInfos,
+		})
+		if err != nil {
+			log.Printf("[ERROR] [AUTH] Failed to create host status message: %v", err)
+			continue
+		}
+
+		if err := session.Send(msg); err != nil {
+			log.Printf("[ERROR] [AUTH] Failed to send host status: %v", err)
+		} else {
+			log.Printf("[DEBUG] [AUTH] Sent HOST_STATUS for %s with %d processes", hostID, len(processInfos))
+		}
+	}
 }
 
 func (s *Server) handleHostConnect(connSession *ConnectedSession, msg *protocol.Message) error {
@@ -307,14 +381,12 @@ func (s *Server) handleHostConnect(connSession *ConnectedSession, msg *protocol.
 	// Track host connection in session
 	s.sessionManager.AddHostConnection(connSession.ID, payload.HostID)
 
-	// Scan for existing tmux sessions and reattach/register them
-	// This handles both:
-	// 1. Sessions that are registered but detached (from a previous disconnect)
-	// 2. Orphaned sessions that were never registered (e.g., from a server restart)
-	processInfos := s.scanAndRegisterTmuxSessions(connSession, payload.HostID, conn.Client)
+	// Scan for existing tmux sessions
+	// Returns: reattached processes (already registered) and detached sessions (need manual reattach)
+	processInfos, detachedProcesses := s.scanAndRegisterTmuxSessions(connSession, payload.HostID, conn.Client)
 
 	// Also scan for existing AgentAPI servers (for Claude process detection)
-	scannedProcesses, staleProcesses := s.portScanner.ScanPorts(conn.Client, payload.HostID)
+	scannedProcesses, staleAgentAPIs := s.portScanner.ScanPorts(conn.Client, payload.HostID)
 
 	// Cross-reference: if we found an AgentAPI on a port, mark the corresponding process as Claude
 	for _, scanned := range scannedProcesses {
@@ -332,16 +404,21 @@ func (s *Server) handleHostConnect(connSession *ConnectedSession, msg *protocol.
 		}
 	}
 
+	// Merge stale processes: detached tmux sessions + stale AgentAPI ports
+	var allStaleProcesses []protocol.StaleProcess
+	allStaleProcesses = append(allStaleProcesses, detachedProcesses...)
+	allStaleProcesses = append(allStaleProcesses, staleAgentAPIs...)
+
 	// Check requirements (claude and agentapi installation)
 	requirements := pty.CheckRequirements(conn.Client)
 
-	log.Printf("[INFO] [HOST] Connected to %s@%s:%d (found %d tmux sessions, %d stale AgentAPI, claude=%v, agentapi=%v)",
-		conn.Username, conn.Host, conn.Port, len(processInfos), len(staleProcesses),
+	log.Printf("[INFO] [HOST] Connected to %s@%s:%d (found %d active, %d detached, %d stale AgentAPI, claude=%v, agentapi=%v)",
+		conn.Username, conn.Host, conn.Port, len(processInfos), len(detachedProcesses), len(staleAgentAPIs),
 		requirements.ClaudeInstalled, requirements.AgentAPIInstalled)
 
 	var stalePtr *[]protocol.StaleProcess
-	if len(staleProcesses) > 0 {
-		stalePtr = &staleProcesses
+	if len(allStaleProcesses) > 0 {
+		stalePtr = &allStaleProcesses
 	}
 
 	response, err := protocol.NewMessage(protocol.TypeHostStatus, protocol.HostStatusPayload{
@@ -366,10 +443,11 @@ func (s *Server) handleHostDisconnect(connSession *ConnectedSession, msg *protoc
 
 	log.Printf("[DEBUG] [HOST] Disconnect request: hostId=%s", payload.HostID)
 
-	// Kill all processes for this host
+	// Detach from all processes for this host (don't kill them)
+	// Tmux sessions continue running on the remote host
 	procs := s.processRegistry.GetByHost(payload.HostID)
 	for _, proc := range procs {
-		proc.Close()
+		proc.Detach()
 		s.processRegistry.Unregister(proc.ID)
 	}
 
@@ -508,6 +586,11 @@ func (s *Server) handleProcessCreate(connSession *ConnectedSession, msg *protoco
 	// Register process
 	s.processRegistry.Register(proc)
 
+	// Register process with storage for history tracking
+	if s.storage != nil {
+		s.storage.RegisterProcess(processID, payload.HostID)
+	}
+
 	// Set up PTY output handler to forward to WebSocket
 	s.updatePtyOutputHandler(connSession, proc)
 
@@ -546,6 +629,13 @@ func (s *Server) handleProcessKill(connSession *ConnectedSession, msg *protocol.
 		log.Printf("[WARN] [PROCESS] Error closing process %s: %v", payload.ProcessID, err)
 	}
 
+	// Clear history from storage
+	if s.storage != nil {
+		if err := s.storage.UnregisterProcess(payload.ProcessID); err != nil {
+			log.Printf("[WARN] [PROCESS] Error clearing storage for process %s: %v", payload.ProcessID, err)
+		}
+	}
+
 	// Unregister from registry
 	s.processRegistry.Unregister(payload.ProcessID)
 
@@ -554,6 +644,81 @@ func (s *Server) handleProcessKill(connSession *ConnectedSession, msg *protocol.
 	// Send process killed notification
 	response, err := protocol.NewMessage(protocol.TypeProcessKilled, protocol.ProcessKilledPayload{
 		ProcessID: payload.ProcessID,
+	})
+	if err != nil {
+		return err
+	}
+
+	return connSession.Send(response)
+}
+
+func (s *Server) handleProcessReattach(connSession *ConnectedSession, msg *protocol.Message) error {
+	var payload protocol.ProcessReattachPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return err
+	}
+
+	log.Printf("[DEBUG] [PROCESS] Reattach request: hostId=%s tmuxSession=%s processId=%s",
+		payload.HostID, payload.TmuxSession, payload.ProcessID)
+
+	// Get the SSH connection for this host
+	conn := s.sshManager.GetConnection(payload.HostID)
+	if conn == nil {
+		return connSession.SendError("NOT_CONNECTED", "Host is not connected")
+	}
+
+	// Check if process already exists (shouldn't happen, but be safe)
+	if existingProc := s.processRegistry.Get(payload.ProcessID); existingProc != nil {
+		return connSession.SendError("ALREADY_EXISTS", "Process is already registered")
+	}
+
+	// Attach to the existing tmux session
+	// Use default terminal size - client can resize later
+	ptySession, err := pty.AttachToExisting(
+		payload.ProcessID,
+		payload.HostID,
+		payload.TmuxSession,
+		conn.Client,
+		120, // default cols
+		30,  // default rows
+		time.Now(), // We don't have the original start time anymore
+	)
+	if err != nil {
+		log.Printf("[ERROR] [PROCESS] Failed to attach to tmux session %s: %v", payload.TmuxSession, err)
+		return connSession.SendError("ATTACH_FAILED", fmt.Sprintf("Failed to attach: %v", err))
+	}
+
+	// Create process record
+	proc := &process.Process{
+		ID:        payload.ProcessID,
+		Type:      process.TypeShell, // Default to shell
+		HostID:    payload.HostID,
+		PTY:       ptySession,
+		StartedAt: time.Now(),
+		PtyReady:  true,
+	}
+
+	// Get and set the shell PID
+	if shellPID, err := ptySession.GetShellPID(); err == nil {
+		proc.SetShellPID(shellPID)
+	} else {
+		log.Printf("[WARN] [PROCESS] Could not get shell PID for reattached process %s: %v", payload.ProcessID, err)
+	}
+
+	// Register process
+	s.processRegistry.Register(proc)
+
+	// Set up output handler
+	s.updatePtyOutputHandler(connSession, proc)
+
+	// Start output loop
+	ptySession.StartOutputLoop()
+
+	log.Printf("[INFO] [PROCESS] Reattached to process %s (tmux: %s)", payload.ProcessID, payload.TmuxSession)
+
+	// Send process created notification
+	response, err := protocol.NewMessage(protocol.TypeProcessCreated, protocol.ProcessCreatedPayload{
+		Process: proc.ToInfo(),
 	})
 	if err != nil {
 		return err
@@ -742,9 +907,26 @@ func (s *Server) handleClaudeKill(connSession *ConnectedSession, msg *protocol.M
 }
 
 // handleAgentAPIEvent forwards AgentAPI SSE events to the WebSocket client
+// and caches message_update events to storage
 func (s *Server) handleAgentAPIEvent(connSession *ConnectedSession, hostID, processID string, event agentapi.SSEEvent) {
 	log.Printf("[DEBUG] [CLAUDE] Forwarding SSE event: type=%s", event.Type)
 
+	// Cache message_update events to storage
+	if event.Type == agentapi.EventMessageUpdate && s.storage != nil {
+		var msgData agentapi.MessageUpdateData
+		if err := json.Unmarshal(event.Data, &msgData); err == nil {
+			if err := s.storage.UpsertChatMessage(processID, hostID, storage.ChatMessage{
+				MessageID:   msgData.ID,
+				Role:        msgData.Role,
+				Message:     msgData.Message,
+				MessageTime: msgData.Time,
+			}); err != nil {
+				log.Printf("[WARN] [CLAUDE] Failed to cache chat message for process %s: %v", processID, err)
+			}
+		}
+	}
+
+	// Forward to WebSocket client
 	msg, err := protocol.NewMessage(protocol.TypeChatEvent, protocol.ChatEventPayload{
 		HostID:    hostID,
 		ProcessID: processID,
@@ -815,6 +997,95 @@ func (s *Server) handlePtyResize(connSession *ConnectedSession, msg *protocol.Me
 	}
 
 	return nil
+}
+
+func (s *Server) handlePtyHistoryRequest(connSession *ConnectedSession, msg *protocol.Message) error {
+	var payload protocol.PtyHistoryRequestPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return err
+	}
+
+	log.Printf("[DEBUG] [PTY] History request: processId=%s", payload.ProcessID)
+
+	// Check if storage is available
+	if s.storage == nil {
+		errMsg := "Storage not available"
+		response, err := protocol.NewMessage(protocol.TypePtyHistoryComplete, protocol.PtyHistoryCompletePayload{
+			ProcessID: payload.ProcessID,
+			Success:   false,
+			Error:     &errMsg,
+		})
+		if err != nil {
+			return err
+		}
+		return connSession.Send(response)
+	}
+
+	// Get history size
+	totalSize := s.storage.GetPtyHistorySize(payload.ProcessID)
+
+	// Send response metadata
+	response, err := protocol.NewMessage(protocol.TypePtyHistoryResponse, protocol.PtyHistoryResponsePayload{
+		ProcessID:  payload.ProcessID,
+		TotalSize:  totalSize,
+		Compressed: false, // Not using compression for now
+	})
+	if err != nil {
+		return err
+	}
+	if err := connSession.Send(response); err != nil {
+		return err
+	}
+
+	// Get history in chunks
+	chunkSize := 64 * 1024 // 64KB chunks
+	chunkChan, totalChunks, err := s.storage.GetPtyHistoryChunked(payload.ProcessID, chunkSize)
+	if err != nil {
+		errMsg := err.Error()
+		complete, _ := protocol.NewMessage(protocol.TypePtyHistoryComplete, protocol.PtyHistoryCompletePayload{
+			ProcessID: payload.ProcessID,
+			Success:   false,
+			Error:     &errMsg,
+		})
+		return connSession.Send(complete)
+	}
+
+	// Send chunks
+	chunkIndex := 0
+	for chunk := range chunkChan {
+		isLast := chunkIndex == totalChunks-1
+
+		chunkMsg, err := protocol.NewMessage(protocol.TypePtyHistoryChunk, protocol.PtyHistoryChunkPayload{
+			ProcessID:   payload.ProcessID,
+			Data:        storage.EncodeBase64(chunk),
+			ChunkIndex:  chunkIndex,
+			TotalChunks: totalChunks,
+			IsLast:      isLast,
+		})
+		if err != nil {
+			log.Printf("[ERROR] [PTY] Failed to create chunk message: %v", err)
+			continue
+		}
+
+		if err := connSession.Send(chunkMsg); err != nil {
+			log.Printf("[ERROR] [PTY] Failed to send chunk: %v", err)
+			// Continue trying to send remaining chunks
+		}
+
+		chunkIndex++
+	}
+
+	// Send completion
+	complete, err := protocol.NewMessage(protocol.TypePtyHistoryComplete, protocol.PtyHistoryCompletePayload{
+		ProcessID: payload.ProcessID,
+		Success:   true,
+	})
+	if err != nil {
+		return err
+	}
+
+	log.Printf("[INFO] [PTY] Sent %d history chunks (%d bytes) for process %s", chunkIndex, totalSize, payload.ProcessID)
+	return connSession.Send(complete)
 }
 
 func (s *Server) handleChatSubscribe(session *ConnectedSession, msg *protocol.Message) error {
@@ -1011,7 +1282,32 @@ func (s *Server) handleChatHistory(session *ConnectedSession, msg *protocol.Mess
 	// Get the process
 	proc := s.processRegistry.Get(payload.ProcessID)
 	if proc == nil {
-		// Process not found - return empty messages
+		// Process not found - try to get from storage cache
+		if s.storage != nil {
+			storedMessages, err := s.storage.GetChatHistory(payload.ProcessID)
+			if err == nil && len(storedMessages) > 0 {
+				chatMessages := make([]protocol.ChatMessage, len(storedMessages))
+				for i, m := range storedMessages {
+					chatMessages[i] = protocol.ChatMessage{
+						ID:      m.MessageID,
+						Role:    m.Role,
+						Message: m.Message,
+						Time:    m.MessageTime,
+					}
+				}
+				response, err := protocol.NewMessage(protocol.TypeChatMessages, protocol.ChatMessagesPayload{
+					HostID:    payload.HostID,
+					ProcessID: payload.ProcessID,
+					Messages:  chatMessages,
+				})
+				if err != nil {
+					return err
+				}
+				return session.Send(response)
+			}
+		}
+
+		// Return empty messages
 		response, err := protocol.NewMessage(protocol.TypeChatMessages, protocol.ChatMessagesPayload{
 			HostID:    payload.HostID,
 			ProcessID: payload.ProcessID,
@@ -1023,7 +1319,33 @@ func (s *Server) handleChatHistory(session *ConnectedSession, msg *protocol.Mess
 		return session.Send(response)
 	}
 
-	// Check if it's a Claude process
+	// Try to get from storage cache first
+	if s.storage != nil {
+		storedMessages, err := s.storage.GetChatHistory(payload.ProcessID)
+		if err == nil && len(storedMessages) > 0 {
+			chatMessages := make([]protocol.ChatMessage, len(storedMessages))
+			for i, m := range storedMessages {
+				chatMessages[i] = protocol.ChatMessage{
+					ID:      m.MessageID,
+					Role:    m.Role,
+					Message: m.Message,
+					Time:    m.MessageTime,
+				}
+			}
+			log.Printf("[DEBUG] [CHAT] Returning %d messages from cache for process %s", len(chatMessages), payload.ProcessID)
+			response, err := protocol.NewMessage(protocol.TypeChatMessages, protocol.ChatMessagesPayload{
+				HostID:    payload.HostID,
+				ProcessID: payload.ProcessID,
+				Messages:  chatMessages,
+			})
+			if err != nil {
+				return err
+			}
+			return session.Send(response)
+		}
+	}
+
+	// Fallback: Get messages from AgentAPI (for initial sync or if cache is empty)
 	if proc.Type != process.TypeClaude || proc.AgentClient == nil {
 		response, err := protocol.NewMessage(protocol.TypeChatMessages, protocol.ChatMessagesPayload{
 			HostID:    payload.HostID,
@@ -1036,7 +1358,6 @@ func (s *Server) handleChatHistory(session *ConnectedSession, msg *protocol.Mess
 		return session.Send(response)
 	}
 
-	// Get messages from AgentAPI
 	messages, err := proc.AgentClient.GetMessages()
 	if err != nil {
 		log.Printf("[ERROR] [CHAT] GetMessages failed for process %s: %v", payload.ProcessID, err)
@@ -1051,8 +1372,9 @@ func (s *Server) handleChatHistory(session *ConnectedSession, msg *protocol.Mess
 		return session.Send(response)
 	}
 
-	// Convert agentapi.Message to protocol.ChatMessage
+	// Convert and cache messages from AgentAPI
 	chatMessages := make([]protocol.ChatMessage, len(messages))
+	storageMessages := make([]storage.ChatMessage, len(messages))
 	for i, m := range messages {
 		chatMessages[i] = protocol.ChatMessage{
 			ID:      m.ID,
@@ -1060,8 +1382,22 @@ func (s *Server) handleChatHistory(session *ConnectedSession, msg *protocol.Mess
 			Message: m.Message,
 			Time:    m.Time,
 		}
+		storageMessages[i] = storage.ChatMessage{
+			MessageID:   m.ID,
+			Role:        m.Role,
+			Message:     m.Message,
+			MessageTime: m.Time,
+		}
 	}
 
+	// Sync to storage cache
+	if s.storage != nil && len(storageMessages) > 0 {
+		if err := s.storage.SyncChatFromAgentAPI(payload.ProcessID, payload.HostID, storageMessages); err != nil {
+			log.Printf("[WARN] [CHAT] Failed to sync chat history to cache: %v", err)
+		}
+	}
+
+	log.Printf("[DEBUG] [CHAT] Returning %d messages from AgentAPI for process %s (synced to cache)", len(chatMessages), payload.ProcessID)
 	response, err := protocol.NewMessage(protocol.TypeChatMessages, protocol.ChatMessagesPayload{
 		HostID:    payload.HostID,
 		ProcessID: payload.ProcessID,
@@ -1083,9 +1419,18 @@ func strPtr(s string) *string {
 // This is called when a session reconnects to a host with existing processes
 func (s *Server) updatePtyOutputHandler(connSession *ConnectedSession, proc *process.Process) {
 	processID := proc.ID
+	hostID := proc.HostID
 	log.Printf("[DEBUG] [PTY] Updating output handler for process %s to session %s", processID, connSession.ID)
 
 	proc.PTY.SetOutputHandler(func(data []byte) {
+		// Capture to storage for history
+		if s.storage != nil {
+			if err := s.storage.AppendPtyOutput(processID, hostID, data); err != nil {
+				log.Printf("[WARN] [PTY] Failed to store output for process %s: %v", processID, err)
+			}
+		}
+
+		// Forward to WebSocket client
 		outputMsg, err := protocol.NewMessage(protocol.TypePtyOutput, protocol.PtyOutputPayload{
 			ProcessID: processID,
 			Data:      string(data),
@@ -1139,16 +1484,20 @@ func (s *Server) reattachProcess(connSession *ConnectedSession, proc *process.Pr
 	return nil
 }
 
-// scanAndRegisterTmuxSessions scans for existing tmux sessions on a host and registers them
-func (s *Server) scanAndRegisterTmuxSessions(connSession *ConnectedSession, hostID string, sshClient *cryptossh.Client) []protocol.ProcessInfo {
+// scanAndRegisterTmuxSessions scans for existing tmux sessions on a host.
+// Returns:
+// - processInfos: already registered processes that were reattached
+// - detachedProcesses: orphaned tmux sessions that need manual reattach
+func (s *Server) scanAndRegisterTmuxSessions(connSession *ConnectedSession, hostID string, sshClient *cryptossh.Client) ([]protocol.ProcessInfo, []protocol.StaleProcess) {
 	// Scan for tmux sessions
 	tmuxSessions, err := pty.ScanTmuxSessions(sshClient)
 	if err != nil {
 		log.Printf("[WARN] [TMUX] Failed to scan tmux sessions: %v", err)
-		return nil
+		return nil, nil
 	}
 
 	var processInfos []protocol.ProcessInfo
+	var detachedProcesses []protocol.StaleProcess
 
 	for _, tmuxInfo := range tmuxSessions {
 		// Check if we already have this process registered
@@ -1163,51 +1512,16 @@ func (s *Server) scanAndRegisterTmuxSessions(connSession *ConnectedSession, host
 			continue
 		}
 
-		// New orphaned tmux session - create a new process record and attach
-		log.Printf("[INFO] [TMUX] Found orphaned tmux session %s, registering", tmuxInfo.Name)
-
-		ptySession, err := pty.AttachToExisting(
-			tmuxInfo.ProcessID,
-			hostID,
-			tmuxInfo.Name,
-			sshClient,
-			tmuxInfo.Width,
-			tmuxInfo.Height,
-			tmuxInfo.Created,
-		)
-		if err != nil {
-			log.Printf("[WARN] [TMUX] Failed to attach to orphaned session %s: %v", tmuxInfo.Name, err)
-			continue
-		}
-
-		// Create process record
-		proc := &process.Process{
-			ID:        tmuxInfo.ProcessID,
-			Type:      process.TypeShell, // Default to shell - we can detect Claude later
-			HostID:    hostID,
-			PTY:       ptySession,
-			StartedAt: tmuxInfo.Created,
-			PtyReady:  true,
-		}
-
-		// Get and set the shell PID
-		if shellPID, err := ptySession.GetShellPID(); err == nil {
-			proc.SetShellPID(shellPID)
-		} else {
-			log.Printf("[WARN] [TMUX] Could not get shell PID for restored process %s: %v", tmuxInfo.ProcessID, err)
-		}
-
-		// Register process
-		s.processRegistry.Register(proc)
-
-		// Set up output handler
-		s.updatePtyOutputHandler(connSession, proc)
-
-		// Start output loop
-		ptySession.StartOutputLoop()
-
-		processInfos = append(processInfos, proc.ToInfo())
+		// Orphaned tmux session - report as detached for manual reattach
+		log.Printf("[INFO] [TMUX] Found detached tmux session %s", tmuxInfo.Name)
+		startedAt := tmuxInfo.Created.Format("2006-01-02T15:04:05Z07:00")
+		detachedProcesses = append(detachedProcesses, protocol.StaleProcess{
+			Reason:      "detached",
+			TmuxSession: &tmuxInfo.Name,
+			ProcessID:   &tmuxInfo.ProcessID,
+			StartedAt:   &startedAt,
+		})
 	}
 
-	return processInfos
+	return processInfos, detachedProcesses
 }

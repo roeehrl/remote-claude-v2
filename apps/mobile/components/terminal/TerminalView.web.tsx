@@ -2,12 +2,15 @@ import React, { useEffect, useRef, useCallback, useState } from 'react';
 import { StyleSheet, View, Text, ActivityIndicator } from 'react-native';
 import { useTheme, useThemeColors } from '@/providers/ThemeProvider';
 import { useBridge, useMessageHandler } from '@/providers/BridgeProvider';
-import { useTerminalStore, useSettingsStore, selectFontSize } from '@/stores';
+import { useSettingsStore, selectFontSize } from '@/stores';
 import {
   Message,
   Messages,
   MessageTypes,
   PtyOutputPayload,
+  PtyHistoryResponsePayload,
+  PtyHistoryChunkPayload,
+  PtyHistoryCompletePayload,
 } from '@remote-claude/shared-types';
 
 // Dynamic imports for xterm (client-side only)
@@ -88,13 +91,14 @@ export function TerminalView({ processId, onReady }: TerminalViewProps) {
   const fitAddonRef = useRef<FitAddon | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const loadingProcessIdRef = useRef<string | null>(null);
+  const chunksRef = useRef<string[]>([]);
 
   const { isDarkMode } = useTheme();
   const colors = useThemeColors();
   const { sendMessage } = useBridge();
   const fontSize = useSettingsStore(selectFontSize);
-
-  const { appendOutput, getBuffer } = useTerminalStore();
 
   // ============================================================================
   // Initialize terminal (with dynamic imports)
@@ -193,10 +197,12 @@ export function TerminalView({ processId, onReady }: TerminalViewProps) {
           sendMessage(Messages.ptyResize({ processId, cols, rows }));
         }
 
-        // Replay buffer if exists
-        const buffer = getBuffer(processId);
-        if (buffer && buffer.rawOutput) {
-          terminal.write(buffer.rawOutput);
+        // Request history from bridge (stateless - no local storage)
+        if (loadingProcessIdRef.current !== processId) {
+          loadingProcessIdRef.current = processId;
+          chunksRef.current = [];
+          setIsLoadingHistory(true);
+          sendMessage(Messages.ptyHistoryRequest({ processId }));
         }
 
         setIsLoading(false);
@@ -276,21 +282,72 @@ export function TerminalView({ processId, onReady }: TerminalViewProps) {
   }, [fontSize]);
 
   // ============================================================================
-  // Handle PTY output
+  // Handle PTY history response (metadata)
+  // ============================================================================
+
+  useMessageHandler<PtyHistoryResponsePayload>(
+    MessageTypes.PTY_HISTORY_RESPONSE,
+    useCallback((msg: Message<PtyHistoryResponsePayload>) => {
+      if (msg.payload.processId === processId) {
+        // Reset chunks for new history load
+        chunksRef.current = [];
+      }
+    }, [processId]),
+    [processId]
+  );
+
+  // ============================================================================
+  // Handle PTY history chunks
+  // ============================================================================
+
+  useMessageHandler<PtyHistoryChunkPayload>(
+    MessageTypes.PTY_HISTORY_CHUNK,
+    useCallback((msg: Message<PtyHistoryChunkPayload>) => {
+      if (msg.payload.processId === processId && terminalRef.current) {
+        // Decode base64 chunk and write to terminal
+        try {
+          const decoded = atob(msg.payload.data);
+          chunksRef.current.push(decoded);
+          // Progressive rendering: write to terminal as chunks arrive
+          terminalRef.current.write(decoded);
+        } catch (err) {
+          console.error('Failed to decode PTY history chunk:', err);
+        }
+      }
+    }, [processId]),
+    [processId]
+  );
+
+  // ============================================================================
+  // Handle PTY history complete
+  // ============================================================================
+
+  useMessageHandler<PtyHistoryCompletePayload>(
+    MessageTypes.PTY_HISTORY_COMPLETE,
+    useCallback((msg: Message<PtyHistoryCompletePayload>) => {
+      if (msg.payload.processId === processId) {
+        setIsLoadingHistory(false);
+        if (!msg.payload.success) {
+          console.error('PTY history load failed:', msg.payload.error);
+        }
+      }
+    }, [processId]),
+    [processId]
+  );
+
+  // ============================================================================
+  // Handle live PTY output (no storage, just display)
   // ============================================================================
 
   useMessageHandler<PtyOutputPayload>(
     MessageTypes.PTY_OUTPUT,
     useCallback((msg: Message<PtyOutputPayload>) => {
       if (msg.payload.processId === processId) {
-        const data = msg.payload.data;
-        // Write to terminal
-        terminalRef.current?.write(data);
-        // Store in buffer for replay
-        appendOutput(processId, data);
+        // Write to terminal - no local storage
+        terminalRef.current?.write(msg.payload.data);
       }
-    }, [processId, appendOutput]),
-    [processId, appendOutput]
+    }, [processId]),
+    [processId]
   );
 
   // ============================================================================

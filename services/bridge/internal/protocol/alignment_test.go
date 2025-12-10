@@ -33,9 +33,13 @@ func TestMessageTypeAlignment(t *testing.T) {
 		"CLAUDE_KILL":  "claude_kill",
 
 		// PTY (Terminal)
-		"PTY_INPUT":  "pty_input",
-		"PTY_OUTPUT": "pty_output",
-		"PTY_RESIZE": "pty_resize",
+		"PTY_INPUT":            "pty_input",
+		"PTY_OUTPUT":           "pty_output",
+		"PTY_RESIZE":           "pty_resize",
+		"PTY_HISTORY_REQUEST":  "pty_history_request",
+		"PTY_HISTORY_RESPONSE": "pty_history_response",
+		"PTY_HISTORY_CHUNK":    "pty_history_chunk",
+		"PTY_HISTORY_COMPLETE": "pty_history_complete",
 
 		// Chat (AgentAPI)
 		"CHAT_SUBSCRIBE":     "chat_subscribe",
@@ -69,9 +73,13 @@ func TestMessageTypeAlignment(t *testing.T) {
 		"PROCESS_UPDATED":     TypeProcessUpdated,
 		"CLAUDE_START":       TypeClaudeStart,
 		"CLAUDE_KILL":        TypeClaudeKill,
-		"PTY_INPUT":          TypePtyInput,
-		"PTY_OUTPUT":         TypePtyOutput,
-		"PTY_RESIZE":         TypePtyResize,
+		"PTY_INPUT":            TypePtyInput,
+		"PTY_OUTPUT":           TypePtyOutput,
+		"PTY_RESIZE":           TypePtyResize,
+		"PTY_HISTORY_REQUEST":  TypePtyHistoryRequest,
+		"PTY_HISTORY_RESPONSE": TypePtyHistoryResponse,
+		"PTY_HISTORY_CHUNK":    TypePtyHistoryChunk,
+		"PTY_HISTORY_COMPLETE": TypePtyHistoryComplete,
 		"CHAT_SUBSCRIBE":     TypeChatSubscribe,
 		"CHAT_UNSUBSCRIBE":   TypeChatUnsubscribe,
 		"CHAT_SEND":          TypeChatSend,
@@ -185,6 +193,41 @@ func TestPayloadJSONFieldAlignment(t *testing.T) {
 				AgentAPIReady: true,
 			},
 			expectedFields: []string{"id", "type", "ptyReady", "agentApiReady"},
+		},
+		{
+			name: "PtyHistoryRequestPayload",
+			payload: PtyHistoryRequestPayload{
+				ProcessID: "proc-id",
+			},
+			expectedFields: []string{"processId"},
+		},
+		{
+			name: "PtyHistoryResponsePayload",
+			payload: PtyHistoryResponsePayload{
+				ProcessID:  "proc-id",
+				TotalSize:  1024,
+				Compressed: false,
+			},
+			expectedFields: []string{"processId", "totalSize", "compressed"},
+		},
+		{
+			name: "PtyHistoryChunkPayload",
+			payload: PtyHistoryChunkPayload{
+				ProcessID:   "proc-id",
+				Data:        "base64data",
+				ChunkIndex:  0,
+				TotalChunks: 1,
+				IsLast:      true,
+			},
+			expectedFields: []string{"processId", "data", "chunkIndex", "totalChunks", "isLast"},
+		},
+		{
+			name: "PtyHistoryCompletePayload",
+			payload: PtyHistoryCompletePayload{
+				ProcessID: "proc-id",
+				Success:   true,
+			},
+			expectedFields: []string{"processId", "success"},
 		},
 	}
 

@@ -3,7 +3,7 @@ import { StyleSheet, Pressable, View as RNView, ActivityIndicator } from 'react-
 import { Text, View } from '@/components/Themed';
 import { useThemeColors } from '@/providers/ThemeProvider';
 import { SSHHost } from '@/stores/settingsStore';
-import { ConnectedHost, HostConnectionState } from '@/stores/hostStore';
+import { ConnectedHost, HostConnectionState } from '@/providers/BridgeProvider';
 import { ProcessInfo, StaleProcess } from '@remote-claude/shared-types';
 import { ProcessCard } from './ProcessCard';
 import { StaleProcessCard } from './StaleProcessCard';
@@ -25,7 +25,8 @@ interface HostCardProps {
   onStartClaude: (processId: string) => void;
   onKillClaude: (processId: string) => void;
   onKillProcess: (processId: string) => void;
-  onKillStaleProcess: (port: number) => void;
+  onKillStaleProcess: (stale: StaleProcess) => void;
+  onReattachStaleProcess: (stale: StaleProcess) => void;
   onRefreshRequirements: () => void;
 }
 
@@ -45,6 +46,7 @@ export function HostCard({
   onKillClaude,
   onKillProcess,
   onKillStaleProcess,
+  onReattachStaleProcess,
   onRefreshRequirements,
 }: HostCardProps) {
   const colors = useThemeColors();
@@ -199,17 +201,18 @@ export function HostCard({
             </RNView>
           )}
 
-          {/* Stale Processes */}
+          {/* Stale/Detached Processes */}
           {isConnected && staleProcesses.length > 0 && (
             <RNView style={styles.staleList}>
-              <Text style={[styles.sectionTitle, { color: colors.error }]}>
-                Stale Processes (need cleanup)
+              <Text style={[styles.sectionTitle, { color: colors.warning }]}>
+                Detached / Stale Processes
               </Text>
-              {staleProcesses.map(stale => (
+              {staleProcesses.map((stale, index) => (
                 <StaleProcessCard
-                  key={stale.port}
+                  key={stale.processId || stale.tmuxSession || stale.port || index}
                   staleProcess={stale}
-                  onKill={() => onKillStaleProcess(stale.port)}
+                  onKill={() => onKillStaleProcess(stale)}
+                  onReattach={stale.tmuxSession ? () => onReattachStaleProcess(stale) : undefined}
                 />
               ))}
             </RNView>

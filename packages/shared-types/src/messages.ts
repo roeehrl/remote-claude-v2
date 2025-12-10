@@ -30,6 +30,7 @@ export const MessageTypes = {
   PROCESS_KILL: 'process_kill',
   PROCESS_KILLED: 'process_killed',
   PROCESS_UPDATED: 'process_updated',
+  PROCESS_REATTACH: 'process_reattach',
 
   // Claude Conversion
   CLAUDE_START: 'claude_start',
@@ -39,6 +40,12 @@ export const MessageTypes = {
   PTY_INPUT: 'pty_input',
   PTY_OUTPUT: 'pty_output',
   PTY_RESIZE: 'pty_resize',
+
+  // PTY History
+  PTY_HISTORY_REQUEST: 'pty_history_request',
+  PTY_HISTORY_RESPONSE: 'pty_history_response',
+  PTY_HISTORY_CHUNK: 'pty_history_chunk',
+  PTY_HISTORY_COMPLETE: 'pty_history_complete',
 
   // Chat (AgentAPI)
   CHAT_SUBSCRIBE: 'chat_subscribe',
@@ -87,8 +94,11 @@ export interface ProcessInfo {
 }
 
 export interface StaleProcess {
-  port: number;
-  reason: string; // "connection_refused", "timeout", etc.
+  port?: number; // AgentAPI port (if applicable)
+  reason: string; // "connection_refused", "timeout", "detached"
+  tmuxSession?: string; // tmux session name (for reattach)
+  processId?: string; // Process ID extracted from tmux name
+  startedAt?: string; // When the session was created
 }
 
 // ============================================================================
@@ -188,6 +198,12 @@ export interface ProcessKilledPayload {
   processId: string;
 }
 
+export interface ProcessReattachPayload {
+  hostId: string;
+  tmuxSession: string;
+  processId: string; // Original process ID from tmux session name
+}
+
 export interface ProcessUpdatedPayload {
   id: string;
   type: ProcessType;
@@ -228,6 +244,34 @@ export interface PtyResizePayload {
   processId: string;
   cols: number;
   rows: number;
+}
+
+// ============================================================================
+// PTY History Payloads
+// ============================================================================
+
+export interface PtyHistoryRequestPayload {
+  processId: string;
+}
+
+export interface PtyHistoryResponsePayload {
+  processId: string;
+  totalSize: number;
+  compressed: boolean;
+}
+
+export interface PtyHistoryChunkPayload {
+  processId: string;
+  data: string; // Base64 encoded
+  chunkIndex: number;
+  totalChunks: number;
+  isLast: boolean;
+}
+
+export interface PtyHistoryCompletePayload {
+  processId: string;
+  success: boolean;
+  error?: string;
 }
 
 // ============================================================================
@@ -379,6 +423,9 @@ export const Messages = {
   processUpdated: (payload: ProcessUpdatedPayload) =>
     createMessage(MessageTypes.PROCESS_UPDATED, payload),
 
+  processReattach: (payload: ProcessReattachPayload) =>
+    createMessage(MessageTypes.PROCESS_REATTACH, payload),
+
   // Claude conversion
   claudeStart: (payload: ClaudeStartPayload) =>
     createMessage(MessageTypes.CLAUDE_START, payload),
@@ -395,6 +442,19 @@ export const Messages = {
 
   ptyResize: (payload: PtyResizePayload) =>
     createMessage(MessageTypes.PTY_RESIZE, payload),
+
+  // PTY History
+  ptyHistoryRequest: (payload: PtyHistoryRequestPayload) =>
+    createMessage(MessageTypes.PTY_HISTORY_REQUEST, payload),
+
+  ptyHistoryResponse: (payload: PtyHistoryResponsePayload) =>
+    createMessage(MessageTypes.PTY_HISTORY_RESPONSE, payload),
+
+  ptyHistoryChunk: (payload: PtyHistoryChunkPayload) =>
+    createMessage(MessageTypes.PTY_HISTORY_CHUNK, payload),
+
+  ptyHistoryComplete: (payload: PtyHistoryCompletePayload) =>
+    createMessage(MessageTypes.PTY_HISTORY_COMPLETE, payload),
 
   // Chat
   chatSubscribe: (payload: ChatSubscribePayload) =>

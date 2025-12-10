@@ -1,27 +1,17 @@
 import React, { useCallback, useMemo, useEffect, useRef } from 'react';
-import { StyleSheet, ScrollView, View as RNView, RefreshControl, View } from 'react-native';
-import { useShallow } from 'zustand/react/shallow';
+import { StyleSheet, ScrollView, View as RNView, RefreshControl, View, Pressable } from 'react-native';
 import { Text } from '@/components/Themed';
 import { HostCard } from '@/components/hosts';
 import { useThemeColors } from '@/providers/ThemeProvider';
-import { useBridge, useMessageHandler, useConnectionState } from '@/providers/BridgeProvider';
+import { useBridge, useConnectionState } from '@/providers/BridgeProvider';
 import {
   useSettingsStore,
-  useHostStore,
   useToastStore,
   selectHosts,
+  selectBridgeUrl,
   getHostCredential,
 } from '@/stores';
-import {
-  Message,
-  Messages,
-  MessageTypes,
-  HostStatusPayload,
-  HostRequirementsResultPayload,
-  ProcessCreatedPayload,
-  ProcessKilledPayload,
-  ProcessUpdatedPayload,
-} from '@remote-claude/shared-types';
+import { Messages } from '@remote-claude/shared-types';
 import { Ionicons } from '@expo/vector-icons';
 
 // ============================================================================
@@ -30,109 +20,30 @@ import { Ionicons } from '@expo/vector-icons';
 
 export default function HostsScreen() {
   const colors = useThemeColors();
-  const { sendMessage } = useBridge();
+  const {
+    sendMessage,
+    connect: connectBridge,
+    disconnect: disconnectBridge,
+    hosts: hostsMap,
+    selectedProcessId,
+    selectProcess,
+    setHostConnecting,
+    setHostDisconnected,
+    setHostError,
+    setHostRequirementsChecking,
+  } = useBridge();
   const { connectionState } = useConnectionState();
   const [refreshing, setRefreshing] = React.useState(false);
 
   // Settings store (configured hosts)
   const hosts = useSettingsStore(selectHosts);
+  const bridgeUrl = useSettingsStore(selectBridgeUrl);
 
   // Toast store
   const { success, error: showError, info } = useToastStore();
 
-  // Host store (connected hosts and processes)
-  // Use useShallow to prevent infinite re-renders from computed arrays
-  const hostsMap = useHostStore(useShallow(state => state.hosts));
+  // Derive connected hosts from Map
   const connectedHosts = useMemo(() => Array.from(hostsMap.values()), [hostsMap]);
-  const selectedProcessId = useHostStore(state => state.selectedProcessId);
-  const {
-    setHostConnecting,
-    setHostConnected,
-    setHostDisconnected,
-    setHostError,
-    setHostRequirements,
-    setHostRequirementsChecking,
-    addProcess,
-    updateProcess,
-    removeProcess,
-    selectProcess,
-  } = useHostStore();
-
-  // ============================================================================
-  // Message Handlers
-  // ============================================================================
-
-  // Handle host status updates
-  useMessageHandler<HostStatusPayload>(
-    MessageTypes.HOST_STATUS,
-    useCallback((msg: Message<HostStatusPayload>) => {
-      const payload = msg.payload;
-      const hostName = hosts.find(h => h.id === payload.hostId)?.name || payload.hostId;
-
-      if (payload.connected) {
-        setHostConnected(payload.hostId, payload.processes, payload.staleProcesses, payload.requirements);
-        success(`Connected to ${hostName}`, `${payload.processes.length} process(es) active`);
-      } else if (payload.error) {
-        setHostError(payload.hostId, payload.error);
-        showError(`Connection failed`, payload.error);
-      } else {
-        setHostDisconnected(payload.hostId);
-        info(`Disconnected from ${hostName}`);
-      }
-    }, [hosts, setHostConnected, setHostDisconnected, setHostError, success, showError, info]),
-    [hosts, setHostConnected, setHostDisconnected, setHostError, success, showError, info]
-  );
-
-  // Handle requirements result
-  useMessageHandler<HostRequirementsResultPayload>(
-    MessageTypes.HOST_REQUIREMENTS_RESULT,
-    useCallback((msg: Message<HostRequirementsResultPayload>) => {
-      const { hostId, requirements, error } = msg.payload;
-      setHostRequirementsChecking(hostId, false);
-      if (!error && requirements) {
-        setHostRequirements(hostId, requirements);
-        if (requirements.claudeInstalled && requirements.agentApiInstalled) {
-          success('Requirements check', 'All requirements installed');
-        }
-      }
-    }, [setHostRequirements, setHostRequirementsChecking, success]),
-    [setHostRequirements, setHostRequirementsChecking, success]
-  );
-
-  // Handle process created
-  useMessageHandler<ProcessCreatedPayload>(
-    MessageTypes.PROCESS_CREATED,
-    useCallback((msg: Message<ProcessCreatedPayload>) => {
-      addProcess(msg.payload.process);
-      success('Shell created', 'New shell session started');
-    }, [addProcess, success]),
-    [addProcess, success]
-  );
-
-  // Handle process killed
-  useMessageHandler<ProcessKilledPayload>(
-    MessageTypes.PROCESS_KILLED,
-    useCallback((msg: Message<ProcessKilledPayload>) => {
-      removeProcess(msg.payload.processId);
-      info('Process terminated');
-    }, [removeProcess, info]),
-    [removeProcess, info]
-  );
-
-  // Handle process updated
-  useMessageHandler<ProcessUpdatedPayload>(
-    MessageTypes.PROCESS_UPDATED,
-    useCallback((msg: Message<ProcessUpdatedPayload>) => {
-      const update = msg.payload;
-      updateProcess(update);
-
-      // Show toast for Claude state changes
-      if (update.type === 'claude' && update.agentApiReady) {
-        success('Claude ready', 'AgentAPI is now available');
-      }
-    }, [updateProcess, success]),
-    [updateProcess, success]
-  );
 
   // ============================================================================
   // Auto-connect hosts on Bridge reconnect
@@ -237,10 +148,31 @@ export default function HostsScreen() {
     sendMessage(Messages.processKill({ processId }));
   }, [sendMessage]);
 
-  const handleKillStaleProcess = useCallback((hostId: string, port: number) => {
-    // TODO: Implement stale process killing (needs protocol support)
-    console.log('Kill stale process:', hostId, port);
-  }, []);
+  const handleKillStaleProcess = useCallback((hostId: string, stale: { port?: number; tmuxSession?: string }) => {
+    // TODO: Implement stale process killing via tmux kill-session
+    // For now, just log - proper implementation needs bridge support
+    if (stale.tmuxSession) {
+      console.log('Kill detached tmux session:', hostId, stale.tmuxSession);
+      // Future: sendMessage(Messages.killTmuxSession({ hostId, tmuxSession: stale.tmuxSession }));
+    } else if (stale.port) {
+      console.log('Kill stale AgentAPI port:', hostId, stale.port);
+      // This would need to find and kill the process using the port
+    }
+    info('Killing stale processes is not yet implemented');
+  }, [info]);
+
+  const handleReattachStaleProcess = useCallback((hostId: string, stale: { tmuxSession?: string; processId?: string }) => {
+    if (!stale.tmuxSession || !stale.processId) {
+      showError('Cannot reattach: missing session info');
+      return;
+    }
+    sendMessage(Messages.processReattach({
+      hostId,
+      tmuxSession: stale.tmuxSession,
+      processId: stale.processId,
+    }));
+    info('Reattaching to session...');
+  }, [sendMessage, info, showError]);
 
   const handleRefreshRequirements = useCallback((hostId: string) => {
     setHostRequirementsChecking(hostId, true);
@@ -272,28 +204,57 @@ export default function HostsScreen() {
       {/* Connection Status Banner */}
       {isDisconnected && (
         <RNView style={[styles.banner, { backgroundColor: colors.statusDisconnected + '20' }]}>
-          <Ionicons name="cloud-offline" size={18} color={colors.statusDisconnected} />
-          <Text style={[styles.bannerText, { color: colors.statusDisconnected }]}>
-            Not connected to Bridge. Check Settings.
-          </Text>
+          <RNView style={styles.bannerContent}>
+            <Ionicons name="cloud-offline" size={18} color={colors.statusDisconnected} />
+            <Text style={[styles.bannerText, { color: colors.statusDisconnected }]}>
+              Not connected to Bridge
+            </Text>
+          </RNView>
+          <Pressable
+            style={[styles.bannerButton, { backgroundColor: colors.primary }]}
+            onPress={() => connectBridge(bridgeUrl)}
+          >
+            <Text style={styles.bannerButtonText}>Connect</Text>
+          </Pressable>
         </RNView>
       )}
 
       {connectionState === 'connecting' && (
         <RNView style={[styles.banner, { backgroundColor: colors.statusConnecting + '20' }]}>
-          <Ionicons name="cloud" size={18} color={colors.statusConnecting} />
-          <Text style={[styles.bannerText, { color: colors.statusConnecting }]}>
-            Connecting to Bridge...
-          </Text>
+          <RNView style={styles.bannerContent}>
+            <Ionicons name="cloud" size={18} color={colors.statusConnecting} />
+            <Text style={[styles.bannerText, { color: colors.statusConnecting }]}>
+              Connecting to Bridge...
+            </Text>
+          </RNView>
         </RNView>
       )}
 
       {connectionState === 'reconnecting' && (
         <RNView style={[styles.banner, { backgroundColor: colors.statusConnecting + '20' }]}>
-          <Ionicons name="refresh" size={18} color={colors.statusConnecting} />
-          <Text style={[styles.bannerText, { color: colors.statusConnecting }]}>
-            Reconnecting to Bridge...
-          </Text>
+          <RNView style={styles.bannerContent}>
+            <Ionicons name="refresh" size={18} color={colors.statusConnecting} />
+            <Text style={[styles.bannerText, { color: colors.statusConnecting }]}>
+              Reconnecting to Bridge...
+            </Text>
+          </RNView>
+        </RNView>
+      )}
+
+      {connectionState === 'connected' && (
+        <RNView style={[styles.banner, { backgroundColor: colors.statusConnected + '20' }]}>
+          <RNView style={styles.bannerContent}>
+            <Ionicons name="cloud-done" size={18} color={colors.statusConnected} />
+            <Text style={[styles.bannerText, { color: colors.statusConnected }]}>
+              Connected to Bridge
+            </Text>
+          </RNView>
+          <Pressable
+            style={[styles.bannerButton, { backgroundColor: colors.error }]}
+            onPress={() => disconnectBridge()}
+          >
+            <Text style={styles.bannerButtonText}>Disconnect</Text>
+          </Pressable>
         </RNView>
       )}
 
@@ -333,7 +294,8 @@ export default function HostsScreen() {
               onStartClaude={handleStartClaude}
               onKillClaude={handleKillClaude}
               onKillProcess={handleKillProcess}
-              onKillStaleProcess={(port) => handleKillStaleProcess(host.id, port)}
+              onKillStaleProcess={(stale) => handleKillStaleProcess(host.id, stale)}
+              onReattachStaleProcess={(stale) => handleReattachStaleProcess(host.id, stale)}
               onRefreshRequirements={() => handleRefreshRequirements(host.id)}
             />
           ))
@@ -354,12 +316,29 @@ const styles = StyleSheet.create({
   banner: {
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'space-between',
     padding: 12,
     gap: 8,
+  },
+  bannerContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    flex: 1,
   },
   bannerText: {
     fontSize: 14,
     fontWeight: '500',
+  },
+  bannerButton: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 6,
+  },
+  bannerButtonText: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '600',
   },
   scrollView: {
     flex: 1,

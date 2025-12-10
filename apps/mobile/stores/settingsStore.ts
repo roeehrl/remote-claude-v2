@@ -24,6 +24,7 @@ export interface SSHHost {
 export interface SettingsState {
   // Bridge connection
   bridgeUrl: string;
+  bridgeAutoConnect: boolean; // Auto-connect to bridge on app start
 
   // SSH Hosts
   hosts: SSHHost[];
@@ -33,6 +34,7 @@ export interface SettingsState {
 
   // Actions
   setBridgeUrl: (url: string) => void;
+  setBridgeAutoConnect: (autoConnect: boolean) => void;
   addHost: (host: Omit<SSHHost, 'id'>) => string;
   updateHost: (id: string, updates: Partial<Omit<SSHHost, 'id'>>) => void;
   removeHost: (id: string) => void;
@@ -140,12 +142,17 @@ export const useSettingsStore = create<SettingsState>()(
     (set, get) => ({
       // Initial state
       bridgeUrl: 'ws://localhost:8080/ws',
+      bridgeAutoConnect: false, // Default: don't auto-connect
       hosts: [],
       fontSize: 14,
 
       // Actions
       setBridgeUrl: (url: string) => {
         set({ bridgeUrl: url });
+      },
+
+      setBridgeAutoConnect: (autoConnect: boolean) => {
+        set({ bridgeAutoConnect: autoConnect });
       },
 
       addHost: (host: Omit<SSHHost, 'id'>): string => {
@@ -183,6 +190,7 @@ export const useSettingsStore = create<SettingsState>()(
       // Only persist these keys (not functions)
       partialize: (state) => ({
         bridgeUrl: state.bridgeUrl,
+        bridgeAutoConnect: state.bridgeAutoConnect,
         hosts: state.hosts,
         fontSize: state.fontSize,
       }),
@@ -195,6 +203,7 @@ export const useSettingsStore = create<SettingsState>()(
 // ============================================================================
 
 export const selectBridgeUrl = (state: SettingsState) => state.bridgeUrl;
+export const selectBridgeAutoConnect = (state: SettingsState) => state.bridgeAutoConnect;
 export const selectHosts = (state: SettingsState) => state.hosts;
 export const selectFontSize = (state: SettingsState) => state.fontSize;
 export const selectHostById = (id: string) => (state: SettingsState) =>

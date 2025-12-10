@@ -284,7 +284,7 @@ func (p *Process) SetAgentAPIPID(pid int) {
 	p.AgentAPIPID = &pid
 }
 
-// Close closes the process and its resources
+// Close closes the process and its resources (kills tmux session)
 func (p *Process) Close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -301,9 +301,34 @@ func (p *Process) Close() error {
 		p.AgentClient = nil
 	}
 
-	// Close PTY
+	// Close PTY (kills tmux session)
 	if p.PTY != nil {
 		return p.PTY.Close()
+	}
+	return nil
+}
+
+// Detach disconnects from the process without killing it.
+// The tmux session continues running on the remote host.
+func (p *Process) Detach() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Close SSE client
+	if p.SSEClient != nil {
+		p.SSEClient.Close()
+		p.SSEClient = nil
+	}
+
+	// Close AgentAPI client
+	if p.AgentClient != nil {
+		p.AgentClient.Close()
+		p.AgentClient = nil
+	}
+
+	// Detach from PTY (tmux session keeps running)
+	if p.PTY != nil {
+		return p.PTY.Detach()
 	}
 	return nil
 }

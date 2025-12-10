@@ -5,6 +5,7 @@ import React, {
   useRef,
   useState,
   useCallback,
+  useMemo,
   ReactNode,
 } from 'react';
 import {
@@ -13,6 +14,14 @@ import {
   MessageTypes,
   Messages,
   AuthResultPayload,
+  ProcessInfo,
+  StaleProcess,
+  HostRequirements,
+  HostStatusPayload,
+  ProcessCreatedPayload,
+  ProcessKilledPayload,
+  ProcessUpdatedPayload,
+  HostRequirementsResultPayload,
 } from '@remote-claude/shared-types';
 
 // ============================================================================
@@ -21,10 +30,23 @@ import {
 
 export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
 
+export type HostConnectionState = 'disconnected' | 'connecting' | 'connected' | 'error';
+
 export type MessageHandler<T = unknown> = (message: Message<T>) => void;
 
+// Host runtime state (server state mirrored locally)
+export interface ConnectedHost {
+  id: string;
+  state: HostConnectionState;
+  processes: ProcessInfo[];
+  staleProcesses: StaleProcess[];
+  error?: string;
+  requirements?: HostRequirements;
+  requirementsChecking?: boolean;
+}
+
 interface BridgeContextValue {
-  // Connection state
+  // Bridge connection state
   connectionState: ConnectionState;
   sessionId: string | null;
   reconnectToken: string | null;
@@ -36,6 +58,19 @@ interface BridgeContextValue {
   // Messaging
   sendMessage: <T>(message: Message<T>) => void;
   addMessageHandler: (type: MessageType, handler: MessageHandler) => () => void;
+
+  // Server state (read-only, received from bridge)
+  hosts: Map<string, ConnectedHost>;
+
+  // Client state (UI selection)
+  selectedProcessId: string | null;
+  selectProcess: (processId: string | null) => void;
+
+  // Host state mutations (triggered by bridge messages, exposed for UI feedback)
+  setHostConnecting: (hostId: string) => void;
+  setHostDisconnected: (hostId: string) => void;
+  setHostError: (hostId: string, error: string) => void;
+  setHostRequirementsChecking: (hostId: string, checking: boolean) => void;
 }
 
 interface BridgeProviderProps {
@@ -76,12 +111,18 @@ const BridgeContext = createContext<BridgeContextValue | null>(null);
 export function BridgeProvider({
   children,
   autoConnect = false,
-  defaultUrl = 'ws://localhost:8080/ws',
+  defaultUrl = '',
 }: BridgeProviderProps) {
-  // Connection state
+  // Bridge connection state
   const [connectionState, setConnectionState] = useState<ConnectionState>('disconnected');
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [reconnectToken, setReconnectToken] = useState<string | null>(null);
+
+  // Server state (hosts and processes - received from bridge)
+  const [hosts, setHosts] = useState<Map<string, ConnectedHost>>(new Map());
+
+  // Client state (UI selection)
+  const [selectedProcessId, setSelectedProcessId] = useState<string | null>(null);
 
   // WebSocket ref
   const wsRef = useRef<WebSocket | null>(null);
@@ -272,6 +313,214 @@ export function BridgeProvider({
   }, []);
 
   // ============================================================================
+  // Host State Management (server state mutations)
+  // ============================================================================
+
+  const setHostConnecting = useCallback((hostId: string) => {
+    setHosts(prev => {
+      const newHosts = new Map(prev);
+      newHosts.set(hostId, {
+        id: hostId,
+        state: 'connecting',
+        processes: [],
+        staleProcesses: [],
+      });
+      return newHosts;
+    });
+  }, []);
+
+  const setHostConnected = useCallback((
+    hostId: string,
+    processes: ProcessInfo[] = [],
+    staleProcesses: StaleProcess[] = [],
+    requirements?: HostRequirements
+  ) => {
+    setHosts(prev => {
+      const newHosts = new Map(prev);
+      newHosts.set(hostId, {
+        id: hostId,
+        state: 'connected',
+        processes: processes ?? [],
+        staleProcesses: staleProcesses ?? [],
+        requirements,
+      });
+      return newHosts;
+    });
+  }, []);
+
+  const setHostDisconnected = useCallback((hostId: string) => {
+    setHosts(prev => {
+      const newHosts = new Map(prev);
+      // Clear selection if selected process belonged to this host
+      const host = newHosts.get(hostId);
+      if (host?.processes?.some(p => p.id === selectedProcessId)) {
+        setSelectedProcessId(null);
+      }
+      newHosts.delete(hostId);
+      return newHosts;
+    });
+  }, [selectedProcessId]);
+
+  const setHostError = useCallback((hostId: string, error: string) => {
+    setHosts(prev => {
+      const newHosts = new Map(prev);
+      const existing = newHosts.get(hostId);
+      if (existing) {
+        newHosts.set(hostId, { ...existing, state: 'error', error });
+      } else {
+        newHosts.set(hostId, {
+          id: hostId,
+          state: 'error',
+          processes: [],
+          staleProcesses: [],
+          error,
+        });
+      }
+      return newHosts;
+    });
+  }, []);
+
+  const setHostRequirements = useCallback((hostId: string, requirements: HostRequirements) => {
+    setHosts(prev => {
+      const newHosts = new Map(prev);
+      const existing = newHosts.get(hostId);
+      if (existing) {
+        newHosts.set(hostId, { ...existing, requirements, requirementsChecking: false });
+      }
+      return newHosts;
+    });
+  }, []);
+
+  const setHostRequirementsChecking = useCallback((hostId: string, checking: boolean) => {
+    setHosts(prev => {
+      const newHosts = new Map(prev);
+      const existing = newHosts.get(hostId);
+      if (existing) {
+        newHosts.set(hostId, { ...existing, requirementsChecking: checking });
+      }
+      return newHosts;
+    });
+  }, []);
+
+  const addProcess = useCallback((process: ProcessInfo) => {
+    setHosts(prev => {
+      const newHosts = new Map(prev);
+      const host = newHosts.get(process.hostId);
+      if (host) {
+        newHosts.set(process.hostId, {
+          ...host,
+          processes: [...(host.processes ?? []), process],
+        });
+      }
+      return newHosts;
+    });
+  }, []);
+
+  const updateProcess = useCallback((update: ProcessUpdatedPayload) => {
+    setHosts(prev => {
+      const newHosts = new Map(prev);
+      for (const [hostId, host] of newHosts) {
+        const processes = host.processes ?? [];
+        const processIndex = processes.findIndex(p => p.id === update.id);
+        if (processIndex !== -1) {
+          const updatedProcesses = [...processes];
+          updatedProcesses[processIndex] = {
+            ...updatedProcesses[processIndex],
+            type: update.type,
+            port: update.port,
+            ptyReady: update.ptyReady,
+            agentApiReady: update.agentApiReady,
+            shellPid: update.shellPid,
+            agentApiPid: update.agentApiPid,
+          };
+          newHosts.set(hostId, { ...host, processes: updatedProcesses });
+          break;
+        }
+      }
+      return newHosts;
+    });
+  }, []);
+
+  const removeProcess = useCallback((processId: string) => {
+    setHosts(prev => {
+      const newHosts = new Map(prev);
+      for (const [hostId, host] of newHosts) {
+        const processes = host.processes ?? [];
+        const processIndex = processes.findIndex(p => p.id === processId);
+        if (processIndex !== -1) {
+          newHosts.set(hostId, {
+            ...host,
+            processes: processes.filter(p => p.id !== processId),
+          });
+          break;
+        }
+      }
+      return newHosts;
+    });
+    // Clear selection if this was the selected process
+    setSelectedProcessId(prev => prev === processId ? null : prev);
+  }, []);
+
+  const selectProcess = useCallback((processId: string | null) => {
+    setSelectedProcessId(processId);
+  }, []);
+
+  // ============================================================================
+  // Server State Message Handlers
+  // ============================================================================
+
+  // Handle host status updates
+  useEffect(() => {
+    return addMessageHandler(MessageTypes.HOST_STATUS, (msg: Message<HostStatusPayload>) => {
+      const payload = msg.payload;
+      if (payload.connected) {
+        setHostConnected(
+          payload.hostId,
+          payload.processes ?? [],
+          payload.staleProcesses ?? [],
+          payload.requirements
+        );
+      } else if (payload.error) {
+        setHostError(payload.hostId, payload.error);
+      } else {
+        setHostDisconnected(payload.hostId);
+      }
+    });
+  }, [addMessageHandler, setHostConnected, setHostError, setHostDisconnected]);
+
+  // Handle requirements result
+  useEffect(() => {
+    return addMessageHandler(MessageTypes.HOST_REQUIREMENTS_RESULT, (msg: Message<HostRequirementsResultPayload>) => {
+      const { hostId, requirements, error } = msg.payload;
+      setHostRequirementsChecking(hostId, false);
+      if (!error && requirements) {
+        setHostRequirements(hostId, requirements);
+      }
+    });
+  }, [addMessageHandler, setHostRequirements, setHostRequirementsChecking]);
+
+  // Handle process created
+  useEffect(() => {
+    return addMessageHandler(MessageTypes.PROCESS_CREATED, (msg: Message<ProcessCreatedPayload>) => {
+      addProcess(msg.payload.process);
+    });
+  }, [addMessageHandler, addProcess]);
+
+  // Handle process killed
+  useEffect(() => {
+    return addMessageHandler(MessageTypes.PROCESS_KILLED, (msg: Message<ProcessKilledPayload>) => {
+      removeProcess(msg.payload.processId);
+    });
+  }, [addMessageHandler, removeProcess]);
+
+  // Handle process updated
+  useEffect(() => {
+    return addMessageHandler(MessageTypes.PROCESS_UPDATED, (msg: Message<ProcessUpdatedPayload>) => {
+      updateProcess(msg.payload);
+    });
+  }, [addMessageHandler, updateProcess]);
+
+  // ============================================================================
   // Auto-connect on mount
   // ============================================================================
 
@@ -290,6 +539,7 @@ export function BridgeProvider({
   // ============================================================================
 
   const value: BridgeContextValue = {
+    // Bridge connection
     connectionState,
     sessionId,
     reconnectToken,
@@ -297,6 +547,19 @@ export function BridgeProvider({
     disconnect,
     sendMessage,
     addMessageHandler,
+
+    // Server state (read-only)
+    hosts,
+
+    // Client state
+    selectedProcessId,
+    selectProcess,
+
+    // Host state mutations (for UI feedback before server response)
+    setHostConnecting,
+    setHostDisconnected,
+    setHostError,
+    setHostRequirementsChecking,
   };
 
   return (

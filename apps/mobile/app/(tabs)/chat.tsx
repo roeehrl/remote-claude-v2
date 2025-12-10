@@ -1,25 +1,24 @@
-import React, { useCallback, useEffect, useMemo } from 'react';
+import React, { useCallback, useEffect, useMemo, useState, useRef } from 'react';
 import { StyleSheet, View, Pressable, Platform, KeyboardAvoidingView } from 'react-native';
-import { useShallow } from 'zustand/react/shallow';
 import { Text } from '@/components/Themed';
 import { MessageList, ChatInputBar, StatusBar } from '@/components/chat';
 import { useThemeColors } from '@/providers/ThemeProvider';
 import { useBridge, useMessageHandler, useConnectionState } from '@/providers/BridgeProvider';
 import {
-  useHostStore,
-  useChatStore,
-  selectSelectedProcessId,
-  selectHostsMap,
-} from '@/stores';
-import {
   Message,
   Messages,
   MessageTypes,
+  ChatMessage,
   ChatEventPayload,
   ChatMessagesPayload,
   ChatStatusResultPayload,
+  MessageUpdateData,
+  StatusChangeData,
 } from '@remote-claude/shared-types';
 import { Ionicons } from '@expo/vector-icons';
+
+// Local type for agent status
+type AgentStatus = 'running' | 'stable' | 'disconnected';
 
 // ============================================================================
 // Chat Screen
@@ -27,13 +26,8 @@ import { Ionicons } from '@expo/vector-icons';
 
 export default function ChatScreen() {
   const colors = useThemeColors();
-  const { sendMessage } = useBridge();
+  const { sendMessage, hosts: hostsMap, selectedProcessId, selectProcess } = useBridge();
   const { connectionState } = useConnectionState();
-
-  // Host store - use useShallow for Map to prevent infinite re-renders
-  const hostsMap = useHostStore(useShallow(selectHostsMap));
-  const selectedProcessId = useHostStore(selectSelectedProcessId);
-  const { selectProcess } = useHostStore();
 
   // Derive selected process and all processes from hostsMap
   const selectedProcess = useMemo(() => {
@@ -56,27 +50,14 @@ export default function ChatScreen() {
     return processes;
   }, [hostsMap]);
 
-  // Chat store
-  const {
-    initSession,
-    setSubscribed,
-    setMessages,
-    handleChatEvent,
-    setStatus,
-    getSession,
-  } = useChatStore();
+  // LOCAL STATE - no global store, component is completely stateless
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [status, setStatus] = useState<AgentStatus>('disconnected');
+  const [agentType, setAgentType] = useState<string | undefined>();
+  const [isSubscribed, setIsSubscribed] = useState(false);
+  const subscribedProcessRef = useRef<string | null>(null);
 
   const processId = selectedProcess?.id ?? '';
-  const session = useChatStore(useCallback(
-    (state) => processId ? state.sessions.get(processId) : undefined,
-    [processId]
-  ));
-
-  const messages = session?.messages ?? [];
-  const status = session?.status ?? 'disconnected';
-  const isSubscribed = session?.isSubscribed ?? false;
-  const agentType = session?.agentType;
-
   const isConnected = connectionState === 'connected';
   const isClaude = selectedProcess?.type === 'claude';
   const isReady = isClaude && selectedProcess?.agentApiReady;
@@ -90,20 +71,22 @@ export default function ChatScreen() {
       return;
     }
 
-    // Initialize session if needed
-    if (!session) {
-      initSession(processId, selectedProcess.hostId);
-    }
+    // Reset state when switching processes
+    if (subscribedProcessRef.current !== processId) {
+      setMessages([]);
+      setStatus('disconnected');
+      setAgentType(undefined);
+      setIsSubscribed(false);
+      subscribedProcessRef.current = processId;
 
-    // Subscribe to chat
-    if (!isSubscribed) {
+      // Subscribe to chat
       sendMessage(Messages.chatSubscribe({
         hostId: selectedProcess.hostId,
         processId,
       }));
-      setSubscribed(processId, true);
+      setIsSubscribed(true);
 
-      // Request status and history
+      // Request status and history from bridge
       sendMessage(Messages.chatStatus({
         hostId: selectedProcess.hostId,
         processId,
@@ -116,15 +99,16 @@ export default function ChatScreen() {
 
     return () => {
       // Unsubscribe when leaving
-      if (isSubscribed) {
+      if (subscribedProcessRef.current === processId) {
         sendMessage(Messages.chatUnsubscribe({
           hostId: selectedProcess.hostId,
           processId,
         }));
-        setSubscribed(processId, false);
+        subscribedProcessRef.current = null;
+        setIsSubscribed(false);
       }
     };
-  }, [isConnected, processId, isClaude, isReady, isSubscribed]);
+  }, [isConnected, processId, isClaude, isReady, selectedProcess, sendMessage]);
 
   // ============================================================================
   // Message Handlers
@@ -135,21 +119,50 @@ export default function ChatScreen() {
     MessageTypes.CHAT_EVENT,
     useCallback((msg: Message<ChatEventPayload>) => {
       if (msg.payload.processId === processId) {
-        handleChatEvent(msg.payload);
+        const { event: eventType, data } = msg.payload;
+
+        if (eventType === 'message_update') {
+          const msgData = data as MessageUpdateData;
+          setMessages(prev => {
+            const existingIndex = prev.findIndex(m => m.id === msgData.id);
+            const newMessage: ChatMessage = {
+              id: msgData.id,
+              role: msgData.role,
+              message: msgData.message,
+              time: msgData.time,
+            };
+
+            if (existingIndex >= 0) {
+              // Update existing message (streaming update)
+              const updated = [...prev];
+              updated[existingIndex] = newMessage;
+              return updated;
+            } else {
+              // Add new message
+              return [...prev, newMessage];
+            }
+          });
+        } else if (eventType === 'status_change') {
+          const statusData = data as StatusChangeData;
+          setStatus(statusData.status);
+          if (statusData.agentType) {
+            setAgentType(statusData.agentType);
+          }
+        }
       }
-    }, [processId, handleChatEvent]),
-    [processId, handleChatEvent]
+    }, [processId]),
+    [processId]
   );
 
-  // Handle chat history
+  // Handle chat history (from bridge cache)
   useMessageHandler<ChatMessagesPayload>(
     MessageTypes.CHAT_MESSAGES,
     useCallback((msg: Message<ChatMessagesPayload>) => {
       if (msg.payload.processId === processId) {
-        setMessages(processId, msg.payload.messages);
+        setMessages(msg.payload.messages);
       }
-    }, [processId, setMessages]),
-    [processId, setMessages]
+    }, [processId]),
+    [processId]
   );
 
   // Handle status result
@@ -157,10 +170,13 @@ export default function ChatScreen() {
     MessageTypes.CHAT_STATUS_RESULT,
     useCallback((msg: Message<ChatStatusResultPayload>) => {
       if (msg.payload.processId === processId) {
-        setStatus(processId, msg.payload.status, msg.payload.agentType);
+        setStatus(msg.payload.status);
+        if (msg.payload.agentType) {
+          setAgentType(msg.payload.agentType);
+        }
       }
-    }, [processId, setStatus]),
-    [processId, setStatus]
+    }, [processId]),
+    [processId]
   );
 
   // ============================================================================
