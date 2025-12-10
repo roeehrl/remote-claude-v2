@@ -1,0 +1,27 @@
+{
+  "name": "@remote-claude/shared-types",
+  "version": "0.1.0",
+  "description": "Shared TypeScript types for Remote Claude V2 WebSocket protocol",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "keywords": [
+    "remote-claude",
+    "protocol",
+    "types"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.3.0"
+  }
+}

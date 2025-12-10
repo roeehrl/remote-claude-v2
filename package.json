@@ -1,0 +1,30 @@
+{
+  "name": "remote-claude-v2",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Remote Claude V2 - Mobile app and Bridge service for remote Claude Code access via SSH",
+  "scripts": {
+    "build": "pnpm -r build",
+    "dev": "pnpm -r --parallel dev",
+    "test": "pnpm -r test",
+    "test:alignment": "pnpm --filter @remote-claude/mobile test:alignment && pnpm --filter bridge test:alignment",
+    "lint": "pnpm -r lint",
+    "clean": "pnpm -r clean",
+    "typecheck": "pnpm -r typecheck"
+  },
+  "keywords": [
+    "claude",
+    "ssh",
+    "terminal",
+    "mobile",
+    "react-native",
+    "expo"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0",
+    "pnpm": ">=8.0.0"
+  },
+  "packageManager": "pnpm@9.14.4"
+}
