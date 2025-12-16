@@ -1,9 +1,10 @@
-import React, { useState, useCallback } from 'react';
-import { StyleSheet, TextInput, Pressable, View as RNView, ActivityIndicator } from 'react-native';
-import { Text } from '@/components/Themed';
+import React, { useState, useCallback, useEffect } from 'react';
+import { StyleSheet, TextInput, Pressable, View as RNView, ActivityIndicator, Platform, Animated } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useThemeColors } from '@/providers/ThemeProvider';
 import { useSettingsStore, selectFontSize } from '@/stores';
 import { Ionicons } from '@expo/vector-icons';
+import { ActionBar } from '@/components/shared';
 
 // ============================================================================
 // Types
@@ -11,34 +12,68 @@ import { Ionicons } from '@expo/vector-icons';
 
 interface ChatInputBarProps {
   onSend: (message: string) => void;
-  onSendRaw: (data: string) => void;
+  onSendPty: (data: string) => void;
   isLoading?: boolean;
   disabled?: boolean;
+  // Voice input props
+  isListening?: boolean;
+  interimTranscript?: string;
+  speechRecognitionAvailable?: boolean;
+  onStartListening?: () => void;
+  onStopListening?: () => void;
 }
-
-type InputMode = 'text' | 'control';
-
-// ============================================================================
-// Quick Actions
-// ============================================================================
-
-const CONTROL_ACTIONS = [
-  { label: 'Ctrl+C', data: '\x03', tooltip: 'Interrupt' },
-  { label: 'Ctrl+D', data: '\x04', tooltip: 'EOF' },
-  { label: 'Enter', data: '\n', tooltip: 'Enter' },
-  { label: 'Yes', data: 'yes\n', tooltip: 'Yes' },
-  { label: 'No', data: 'no\n', tooltip: 'No' },
-];
 
 // ============================================================================
 // Component
 // ============================================================================
 
-export function ChatInputBar({ onSend, onSendRaw, isLoading, disabled }: ChatInputBarProps) {
+export function ChatInputBar({
+  onSend,
+  onSendPty,
+  isLoading,
+  disabled,
+  isListening,
+  interimTranscript,
+  speechRecognitionAvailable,
+  onStartListening,
+  onStopListening,
+}: ChatInputBarProps) {
   const colors = useThemeColors();
   const fontSize = useSettingsStore(selectFontSize);
   const [message, setMessage] = useState('');
-  const [inputMode, setInputMode] = useState<InputMode>('text');
+  const insets = useSafeAreaInsets();
+
+  // Pulse animation for listening state
+  const pulseAnim = React.useRef(new Animated.Value(1)).current;
+
+  useEffect(() => {
+    if (isListening) {
+      Animated.loop(
+        Animated.sequence([
+          Animated.timing(pulseAnim, {
+            toValue: 1.2,
+            duration: 500,
+            useNativeDriver: true,
+          }),
+          Animated.timing(pulseAnim, {
+            toValue: 1,
+            duration: 500,
+            useNativeDriver: true,
+          }),
+        ])
+      ).start();
+    } else {
+      pulseAnim.stopAnimation();
+      pulseAnim.setValue(1);
+    }
+  }, [isListening, pulseAnim]);
+
+  // Add bottom safe area padding on native (for home indicator)
+  const bottomPadding = Platform.OS !== 'web' ? Math.max(insets.bottom, 8) : 8;
+
+  // Display text: show interim transcript while listening, otherwise show typed message
+  const displayText = isListening && interimTranscript ? interimTranscript : message;
+  const placeholderText = isListening ? 'Listening...' : 'Message Claude...';
 
   const handleSend = useCallback(() => {
     const trimmed = message.trim();
@@ -48,129 +83,91 @@ export function ChatInputBar({ onSend, onSendRaw, isLoading, disabled }: ChatInp
     }
   }, [message, isLoading, disabled, onSend]);
 
-  const handleControlAction = useCallback(
-    (data: string) => {
-      if (!disabled) {
-        onSendRaw(data);
-      }
-    },
-    [disabled, onSendRaw]
-  );
+  const handleMicPress = useCallback(() => {
+    if (isListening) {
+      onStopListening?.();
+    } else {
+      onStartListening?.();
+    }
+  }, [isListening, onStartListening, onStopListening]);
+
+  const showMicButton = speechRecognitionAvailable && Platform.OS !== 'web';
 
   return (
-    <RNView style={[styles.container, { backgroundColor: colors.backgroundSecondary, borderTopColor: colors.border }]}>
-      {/* Mode Toggle */}
-      <RNView style={styles.modeToggle}>
-        <Pressable
+    <RNView style={[styles.container, { backgroundColor: colors.backgroundSecondary, borderTopColor: colors.border, paddingBottom: bottomPadding }]}>
+      {/* Chat message input row */}
+      <RNView style={styles.inputRow}>
+        {/* Microphone button */}
+        {showMicButton && (
+          <Animated.View style={{ transform: [{ scale: isListening ? pulseAnim : 1 }] }}>
+            <Pressable
+              style={({ pressed }) => [
+                styles.micButton,
+                {
+                  backgroundColor: isListening ? colors.error : colors.backgroundTertiary,
+                  opacity: pressed ? 0.5 : 1,
+                },
+              ]}
+              onPress={handleMicPress}
+              disabled={disabled || isLoading}
+            >
+              <Ionicons
+                name={isListening ? 'stop' : 'mic'}
+                size={20}
+                color={isListening ? '#fff' : colors.text}
+              />
+            </Pressable>
+          </Animated.View>
+        )}
+
+        <TextInput
           style={[
-            styles.modeButton,
+            styles.textInput,
             {
-              backgroundColor: inputMode === 'text' ? colors.primary : colors.backgroundTertiary,
+              backgroundColor: colors.chatInputBg,
+              borderColor: isListening ? colors.error : colors.chatInputBorder,
+              color: colors.text,
+              fontSize,
             },
           ]}
-          onPress={() => setInputMode('text')}
-        >
-          <Ionicons
-            name="chatbubble"
-            size={14}
-            color={inputMode === 'text' ? '#fff' : colors.textSecondary}
-          />
-          <Text
-            style={[
-              styles.modeText,
-              { color: inputMode === 'text' ? '#fff' : colors.textSecondary },
-            ]}
-          >
-            Text
-          </Text>
-        </Pressable>
+          value={displayText}
+          onChangeText={setMessage}
+          placeholder={placeholderText}
+          placeholderTextColor={isListening ? colors.error : colors.textMuted}
+          multiline
+          maxLength={10000}
+          editable={!disabled && !isListening}
+          onSubmitEditing={handleSend}
+          blurOnSubmit={false}
+        />
         <Pressable
-          style={[
-            styles.modeButton,
+          style={({ pressed }) => [
+            styles.sendButton,
             {
-              backgroundColor: inputMode === 'control' ? colors.primary : colors.backgroundTertiary,
+              backgroundColor: message.trim() && !isLoading && !disabled
+                ? colors.primary
+                : colors.backgroundTertiary,
+              opacity: pressed ? 0.5 : 1,
+              transform: [{ scale: pressed ? 0.95 : 1 }],
             },
           ]}
-          onPress={() => setInputMode('control')}
+          onPress={handleSend}
+          disabled={!message.trim() || isLoading || disabled}
         >
-          <Ionicons
-            name="game-controller"
-            size={14}
-            color={inputMode === 'control' ? '#fff' : colors.textSecondary}
-          />
-          <Text
-            style={[
-              styles.modeText,
-              { color: inputMode === 'control' ? '#fff' : colors.textSecondary },
-            ]}
-          >
-            Control
-          </Text>
+          {isLoading ? (
+            <ActivityIndicator size="small" color={colors.textSecondary} />
+          ) : (
+            <Ionicons
+              name="send"
+              size={18}
+              color={message.trim() && !disabled ? '#fff' : colors.textMuted}
+            />
+          )}
         </Pressable>
       </RNView>
 
-      {/* Input Area */}
-      {inputMode === 'text' ? (
-        <RNView style={styles.inputRow}>
-          <TextInput
-            style={[
-              styles.textInput,
-              {
-                backgroundColor: colors.chatInputBg,
-                borderColor: colors.chatInputBorder,
-                color: colors.text,
-                fontSize,
-              },
-            ]}
-            value={message}
-            onChangeText={setMessage}
-            placeholder="Message Claude..."
-            placeholderTextColor={colors.textMuted}
-            multiline
-            maxLength={10000}
-            editable={!disabled}
-            onSubmitEditing={handleSend}
-            blurOnSubmit={false}
-          />
-          <Pressable
-            style={[
-              styles.sendButton,
-              {
-                backgroundColor: message.trim() && !isLoading && !disabled
-                  ? colors.primary
-                  : colors.backgroundTertiary,
-              },
-            ]}
-            onPress={handleSend}
-            disabled={!message.trim() || isLoading || disabled}
-          >
-            {isLoading ? (
-              <ActivityIndicator size="small" color={colors.textSecondary} />
-            ) : (
-              <Ionicons
-                name="send"
-                size={18}
-                color={message.trim() && !disabled ? '#fff' : colors.textMuted}
-              />
-            )}
-          </Pressable>
-        </RNView>
-      ) : (
-        <RNView style={styles.controlActions}>
-          {CONTROL_ACTIONS.map((action, index) => (
-            <Pressable
-              key={index}
-              style={[styles.controlButton, { backgroundColor: colors.backgroundTertiary }]}
-              onPress={() => handleControlAction(action.data)}
-              disabled={disabled}
-            >
-              <Text style={[styles.controlText, { color: disabled ? colors.textMuted : colors.text }]}>
-                {action.label}
-              </Text>
-            </Pressable>
-          ))}
-        </RNView>
-      )}
+      {/* Shared action bar */}
+      <ActionBar context="chat" onSendData={onSendPty} disabled={disabled} />
     </RNView>
   );
 }
@@ -182,29 +179,22 @@ export function ChatInputBar({ onSend, onSendRaw, isLoading, disabled }: ChatInp
 const styles = StyleSheet.create({
   container: {
     borderTopWidth: 1,
-    padding: 12,
-  },
-  modeToggle: {
-    flexDirection: 'row',
-    marginBottom: 10,
-    gap: 8,
-  },
-  modeButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
+    paddingTop: 8,
     paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 16,
-    gap: 6,
-  },
-  modeText: {
-    fontSize: 12,
-    fontWeight: '500',
+    gap: 8,
+    flexShrink: 0,
   },
   inputRow: {
     flexDirection: 'row',
     alignItems: 'flex-end',
     gap: 8,
+  },
+  micButton: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   textInput: {
     flex: 1,
@@ -221,20 +211,5 @@ const styles = StyleSheet.create({
     borderRadius: 22,
     alignItems: 'center',
     justifyContent: 'center',
-  },
-  controlActions: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-  },
-  controlButton: {
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    borderRadius: 8,
-  },
-  controlText: {
-    fontSize: 13,
-    fontWeight: '600',
-    fontFamily: 'SpaceMono',
   },
 });

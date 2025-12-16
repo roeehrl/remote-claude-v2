@@ -11,7 +11,17 @@ const (
 	TypeAuth       = "auth"
 	TypeAuthResult = "auth_result"
 
-	// Host Management
+	// Host Configuration (CRUD - stored in bridge)
+	TypeHostConfigList         = "host_config_list"
+	TypeHostConfigListResult   = "host_config_list_result"
+	TypeHostConfigCreate       = "host_config_create"
+	TypeHostConfigCreateResult = "host_config_create_result"
+	TypeHostConfigUpdate       = "host_config_update"
+	TypeHostConfigUpdateResult = "host_config_update_result"
+	TypeHostConfigDelete       = "host_config_delete"
+	TypeHostConfigDeleteResult = "host_config_delete_result"
+
+	// Host Connection (runtime)
 	TypeHostConnect            = "host_connect"
 	TypeHostDisconnect         = "host_disconnect"
 	TypeHostStatus             = "host_status"
@@ -28,6 +38,7 @@ const (
 	TypeProcessKilled     = "process_killed"
 	TypeProcessUpdated    = "process_updated"
 	TypeProcessReattach   = "process_reattach"
+	TypeProcessRename     = "process_rename"
 
 	// Claude Conversion
 	TypeClaudeStart = "claude_start"
@@ -55,6 +66,30 @@ const (
 	TypeChatHistory      = "chat_history"
 	TypeChatMessages     = "chat_messages"
 
+	// Environment Variables - Host Level
+	TypeEnvList      = "env_list"
+	TypeEnvUpdate    = "env_update"
+	TypeEnvResult    = "env_result"
+	TypeEnvSetRcFile = "env_set_rc_file"
+
+	// Environment Variables - Process Level
+	TypeProcessEnvList   = "process_env_list"
+	TypeProcessEnvResult = "process_env_result"
+
+	// Ports Scanning
+	TypePortsScan   = "ports_scan"
+	TypePortsResult = "ports_result"
+
+	// Snippets (global, unrelated to hosts/processes)
+	TypeSnippetList         = "snippet_list"
+	TypeSnippetListResult   = "snippet_list_result"
+	TypeSnippetCreate       = "snippet_create"
+	TypeSnippetCreateResult = "snippet_create_result"
+	TypeSnippetUpdate       = "snippet_update"
+	TypeSnippetUpdateResult = "snippet_update_result"
+	TypeSnippetDelete       = "snippet_delete"
+	TypeSnippetDeleteResult = "snippet_delete_result"
+
 	// Error
 	TypeError = "error"
 )
@@ -63,14 +98,21 @@ const (
 func AllMessageTypes() []string {
 	return []string{
 		TypeAuth, TypeAuthResult,
+		TypeHostConfigList, TypeHostConfigListResult, TypeHostConfigCreate, TypeHostConfigCreateResult,
+		TypeHostConfigUpdate, TypeHostConfigUpdateResult, TypeHostConfigDelete, TypeHostConfigDeleteResult,
 		TypeHostConnect, TypeHostDisconnect, TypeHostStatus, TypeHostCheckRequirements, TypeHostRequirementsResult,
 		TypeProcessList, TypeProcessListResult, TypeProcessCreate, TypeProcessCreated,
-		TypeProcessSelect, TypeProcessKill, TypeProcessKilled, TypeProcessUpdated, TypeProcessReattach,
+		TypeProcessSelect, TypeProcessKill, TypeProcessKilled, TypeProcessUpdated, TypeProcessReattach, TypeProcessRename,
 		TypeClaudeStart, TypeClaudeKill,
 		TypePtyInput, TypePtyOutput, TypePtyResize,
 		TypePtyHistoryRequest, TypePtyHistoryResponse, TypePtyHistoryChunk, TypePtyHistoryComplete,
 		TypeChatSubscribe, TypeChatUnsubscribe, TypeChatSend, TypeChatRaw,
 		TypeChatEvent, TypeChatStatus, TypeChatStatusResult, TypeChatHistory, TypeChatMessages,
+		TypeEnvList, TypeEnvUpdate, TypeEnvResult, TypeEnvSetRcFile,
+		TypeProcessEnvList, TypeProcessEnvResult,
+		TypePortsScan, TypePortsResult,
+		TypeSnippetList, TypeSnippetListResult, TypeSnippetCreate, TypeSnippetCreateResult,
+		TypeSnippetUpdate, TypeSnippetUpdateResult, TypeSnippetDelete, TypeSnippetDeleteResult,
 		TypeError,
 	}
 }
@@ -117,6 +159,7 @@ type ProcessInfo struct {
 	HostID        string      `json:"hostId"`
 	Port          *int        `json:"port,omitempty"`
 	CWD           string      `json:"cwd"`
+	Name          *string     `json:"name,omitempty"` // Custom user-defined name
 	PtyReady      bool        `json:"ptyReady"`
 	AgentAPIReady bool        `json:"agentApiReady"`
 	StartedAt     string      `json:"startedAt"` // ISO timestamp
@@ -151,17 +194,81 @@ type AuthResultPayload struct {
 }
 
 // ============================================================================
-// Host Management Payloads
+// Host Configuration Payloads (CRUD - stored in bridge)
+// ============================================================================
+
+// SSHHostConfig represents a stored SSH host configuration
+type SSHHostConfig struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Host        string `json:"host"`
+	Port        int    `json:"port"`
+	Username    string `json:"username"`
+	AuthType    string `json:"authType"` // "password" or "key"
+	AutoConnect bool   `json:"autoConnect"`
+	CreatedAt   string `json:"createdAt"` // ISO timestamp
+	UpdatedAt   string `json:"updatedAt"` // ISO timestamp
+	// Note: credentials are NOT included in responses for security
+}
+
+type HostConfigListPayload struct {
+	// empty - no params needed
+}
+
+type HostConfigListResultPayload struct {
+	Hosts []SSHHostConfig `json:"hosts"`
+}
+
+type HostConfigCreatePayload struct {
+	Name        string  `json:"name"`
+	Host        string  `json:"host"`
+	Port        int     `json:"port"`
+	Username    string  `json:"username"`
+	AuthType    string  `json:"authType"`   // "password" or "key"
+	Credential  string  `json:"credential"` // password or private key
+	AutoConnect *bool   `json:"autoConnect,omitempty"`
+}
+
+type HostConfigCreateResultPayload struct {
+	Success bool           `json:"success"`
+	Host    *SSHHostConfig `json:"host,omitempty"`
+	Error   *string        `json:"error,omitempty"`
+}
+
+type HostConfigUpdatePayload struct {
+	ID          string  `json:"id"`
+	Name        *string `json:"name,omitempty"`
+	Host        *string `json:"host,omitempty"`
+	Port        *int    `json:"port,omitempty"`
+	Username    *string `json:"username,omitempty"`
+	AuthType    *string `json:"authType,omitempty"`
+	Credential  *string `json:"credential,omitempty"` // only set if changing credential
+	AutoConnect *bool   `json:"autoConnect,omitempty"`
+}
+
+type HostConfigUpdateResultPayload struct {
+	Success bool           `json:"success"`
+	Host    *SSHHostConfig `json:"host,omitempty"`
+	Error   *string        `json:"error,omitempty"`
+}
+
+type HostConfigDeletePayload struct {
+	ID string `json:"id"`
+}
+
+type HostConfigDeleteResultPayload struct {
+	Success bool    `json:"success"`
+	ID      *string `json:"id,omitempty"`
+	Error   *string `json:"error,omitempty"`
+}
+
+// ============================================================================
+// Host Connection Payloads (runtime)
 // ============================================================================
 
 type HostConnectPayload struct {
-	HostID     string  `json:"hostId"`
-	Host       string  `json:"host"`
-	Port       int     `json:"port"`
-	Username   string  `json:"username"`
-	AuthType   string  `json:"authType"` // "password" or "key"
-	Password   *string `json:"password,omitempty"`
-	PrivateKey *string `json:"privateKey,omitempty"`
+	HostID string `json:"hostId"`
+	// No credentials needed - bridge has them stored
 }
 
 type HostDisconnectPayload struct {
@@ -238,10 +345,16 @@ type ProcessReattachPayload struct {
 	ProcessID   string `json:"processId"` // Original process ID from tmux session name
 }
 
+type ProcessRenamePayload struct {
+	ProcessID string `json:"processId"`
+	Name      string `json:"name"`
+}
+
 type ProcessUpdatedPayload struct {
 	ID            string      `json:"id"`
 	Type          ProcessType `json:"type"`
 	Port          *int        `json:"port,omitempty"`
+	Name          *string     `json:"name,omitempty"`
 	PtyReady      bool        `json:"ptyReady"`
 	AgentAPIReady bool        `json:"agentApiReady"`
 	ShellPID      *int        `json:"shellPid,omitempty"`
@@ -253,7 +366,8 @@ type ProcessUpdatedPayload struct {
 // ============================================================================
 
 type ClaudeStartPayload struct {
-	ProcessID string `json:"processId"`
+	ProcessID  string  `json:"processId"`
+	ClaudeArgs *string `json:"claudeArgs,omitempty"` // Optional extra arguments for claude command
 }
 
 type ClaudeKillPayload struct {
@@ -391,4 +505,130 @@ type ErrorPayload struct {
 	Code    string      `json:"code"`
 	Message string      `json:"message"`
 	Details interface{} `json:"details,omitempty"`
+}
+
+// ============================================================================
+// Environment Variables Payloads
+// ============================================================================
+
+type EnvVar struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+// Host-level env management
+type EnvListPayload struct {
+	HostID string `json:"hostId"`
+}
+
+type EnvUpdatePayload struct {
+	HostID     string   `json:"hostId"`
+	CustomVars []EnvVar `json:"customVars"`
+}
+
+type EnvResultPayload struct {
+	HostID         string   `json:"hostId"`
+	SystemVars     []EnvVar `json:"systemVars"`
+	CustomVars     []EnvVar `json:"customVars"`
+	RcFile         string   `json:"rcFile"`
+	DetectedRcFile string   `json:"detectedRcFile"`
+	Error          *string  `json:"error,omitempty"`
+}
+
+type EnvSetRcFilePayload struct {
+	HostID string `json:"hostId"`
+	RcFile string `json:"rcFile"`
+}
+
+// Process-level env viewer (read-only)
+type ProcessEnvListPayload struct {
+	ProcessID string `json:"processId"`
+}
+
+type ProcessEnvResultPayload struct {
+	ProcessID string   `json:"processId"`
+	Vars      []EnvVar `json:"vars"`
+	Error     *string  `json:"error,omitempty"`
+}
+
+// ============================================================================
+// Ports Scanning Payloads
+// ============================================================================
+
+type PortsScanPayload struct {
+	HostID string `json:"hostId"`
+}
+
+type PortInfo struct {
+	Port        int          `json:"port"`
+	Status      string       `json:"status"` // "active", "refused", "timeout", "unknown"
+	ProcessID   *string      `json:"processId,omitempty"`
+	ProcessName *string      `json:"processName,omitempty"`
+	ProcessType *ProcessType `json:"processType,omitempty"`
+	// Enriched from netstat/ss/lsof
+	NetPID     *int    `json:"netPid,omitempty"`
+	NetProcess *string `json:"netProcess,omitempty"`
+	NetUser    *string `json:"netUser,omitempty"`
+}
+
+type PortsResultPayload struct {
+	HostID       string     `json:"hostId"`
+	Ports        []PortInfo `json:"ports"`
+	NetTool      *string    `json:"netTool,omitempty"`      // Which tool was used
+	NetToolError *string    `json:"netToolError,omitempty"` // Error if no tool available
+	Error        *string    `json:"error,omitempty"`
+}
+
+// ============================================================================
+// Snippets Payloads
+// ============================================================================
+
+// Snippet represents a command snippet saved for quick terminal access
+type Snippet struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Content   string `json:"content"`
+	CreatedAt string `json:"createdAt"` // ISO timestamp
+	UpdatedAt string `json:"updatedAt"` // ISO timestamp
+}
+
+type SnippetListPayload struct {
+	// empty - no params needed
+}
+
+type SnippetListResultPayload struct {
+	Snippets []Snippet `json:"snippets"`
+}
+
+type SnippetCreatePayload struct {
+	Name    string `json:"name"`
+	Content string `json:"content"`
+}
+
+type SnippetCreateResultPayload struct {
+	Success bool     `json:"success"`
+	Snippet *Snippet `json:"snippet,omitempty"`
+	Error   *string  `json:"error,omitempty"`
+}
+
+type SnippetUpdatePayload struct {
+	ID      string  `json:"id"`
+	Name    *string `json:"name,omitempty"`
+	Content *string `json:"content,omitempty"`
+}
+
+type SnippetUpdateResultPayload struct {
+	Success bool     `json:"success"`
+	Snippet *Snippet `json:"snippet,omitempty"`
+	Error   *string  `json:"error,omitempty"`
+}
+
+type SnippetDeletePayload struct {
+	ID string `json:"id"`
+}
+
+type SnippetDeleteResultPayload struct {
+	Success bool    `json:"success"`
+	ID      *string `json:"id,omitempty"`
+	Error   *string `json:"error,omitempty"`
 }

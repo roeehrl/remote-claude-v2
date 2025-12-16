@@ -1,15 +1,8 @@
 export {
   useSettingsStore,
-  storeHostCredential,
-  getHostCredential,
-  deleteHostCredential,
   selectBridgeUrl,
   selectBridgeAutoConnect,
-  selectHosts,
   selectFontSize,
-  selectHostById,
-  type SSHHost,
-  type AuthType,
   type SettingsState,
 } from './settingsStore';
 

@@ -3,13 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "description": "Remote Claude V2 - Mobile app and Bridge service for remote Claude Code access via SSH",
-  "workspaces": [
-    "apps/*",
-    "packages/*"
-  ],
   "scripts": {
-    "postinstall": "npm run build:shared-types",
-    "build:shared-types": "cd packages/shared-types && npm run build",
+    "build:shared-types": "cd packages/shared-types && pnpm run build",
     "build": "pnpm -r build",
     "dev": "pnpm -r --parallel dev",
     "test": "pnpm -r test",

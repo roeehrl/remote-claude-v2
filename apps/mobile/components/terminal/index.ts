@@ -4,3 +4,6 @@
 // - TerminalView.tsx is the fallback (FlatList-based, not used anymore)
 export { TerminalView } from './TerminalView';
 export { TerminalInputBar } from './TerminalInputBar';
+export { ProcessEnvModal } from './ProcessEnvModal';
+export { SnippetsModal } from './SnippetsModal';
+export type { SnippetsModalMode } from './SnippetsModal';

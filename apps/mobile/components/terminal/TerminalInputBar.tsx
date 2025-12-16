@@ -1,5 +1,5 @@
 import React, { useState, useCallback } from 'react';
-import { StyleSheet, Pressable, View as RNView, TextInput, ScrollView, Platform } from 'react-native';
+import { StyleSheet, Pressable, View as RNView, TextInput, Platform } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Text } from '@/components/Themed';
 import { useThemeColors } from '@/providers/ThemeProvider';
@@ -7,6 +7,7 @@ import { useBridge } from '@/providers/BridgeProvider';
 import { useSettingsStore, selectFontSize } from '@/stores';
 import { Messages } from '@remote-claude/shared-types';
 import { Ionicons } from '@expo/vector-icons';
+import { ActionBar } from '@/components/shared';
 
 // ============================================================================
 // Types
@@ -15,29 +16,6 @@ import { Ionicons } from '@expo/vector-icons';
 interface TerminalInputBarProps {
   processId: string;
 }
-
-interface QuickAction {
-  label: string;
-  icon?: keyof typeof Ionicons.glyphMap;
-  data: string;
-  tooltip: string;
-}
-
-// ============================================================================
-// Quick Actions Config
-// ============================================================================
-
-const QUICK_ACTIONS: QuickAction[] = [
-  { label: 'Ctrl+C', data: '\x03', tooltip: 'Interrupt' },
-  { label: 'Ctrl+D', data: '\x04', tooltip: 'EOF' },
-  { label: 'Ctrl+Z', data: '\x1a', tooltip: 'Suspend' },
-  { label: 'Esc', data: '\x1b', tooltip: 'Escape' },
-  { label: 'Tab', data: '\t', tooltip: 'Tab/Autocomplete' },
-  { label: '\u2191', icon: 'arrow-up', data: '\x1b[A', tooltip: 'Up Arrow' },
-  { label: '\u2193', icon: 'arrow-down', data: '\x1b[B', tooltip: 'Down Arrow' },
-  { label: '\u2190', icon: 'arrow-back', data: '\x1b[D', tooltip: 'Left Arrow' },
-  { label: '\u2192', icon: 'arrow-forward', data: '\x1b[C', tooltip: 'Right Arrow' },
-];
 
 // ============================================================================
 // Component
@@ -56,10 +34,6 @@ export function TerminalInputBar({ processId }: TerminalInputBarProps) {
   const sendInput = useCallback((data: string) => {
     sendMessage(Messages.ptyInput({ processId, data }));
   }, [processId, sendMessage]);
-
-  const handleAction = useCallback((action: QuickAction) => {
-    sendInput(action.data);
-  }, [sendInput]);
 
   const handleSubmit = useCallback(() => {
     if (inputText) {
@@ -90,7 +64,14 @@ export function TerminalInputBar({ processId }: TerminalInputBarProps) {
           returnKeyType="send"
         />
         <Pressable
-          style={[styles.sendButton, { backgroundColor: inputText ? colors.primary : colors.backgroundTertiary }]}
+          style={({ pressed }) => [
+            styles.sendButton,
+            {
+              backgroundColor: inputText ? colors.primary : colors.backgroundTertiary,
+              opacity: pressed ? 0.5 : 1,
+              transform: [{ scale: pressed ? 0.95 : 1 }],
+            },
+          ]}
           onPress={handleSubmit}
         >
           <Ionicons
@@ -101,27 +82,8 @@ export function TerminalInputBar({ processId }: TerminalInputBarProps) {
         </Pressable>
       </RNView>
 
-      {/* Quick actions row */}
-      <ScrollView
-        horizontal
-        showsHorizontalScrollIndicator={false}
-        contentContainerStyle={styles.actions}
-      >
-        {QUICK_ACTIONS.map((action, index) => (
-          <Pressable
-            key={index}
-            style={[styles.actionButton, { backgroundColor: colors.backgroundTertiary }]}
-            onPress={() => handleAction(action)}
-            accessibilityLabel={action.tooltip}
-          >
-            {action.icon ? (
-              <Ionicons name={action.icon} size={16} color={colors.text} />
-            ) : (
-              <Text style={[styles.actionText, { color: colors.text }]}>{action.label}</Text>
-            )}
-          </Pressable>
-        ))}
-      </ScrollView>
+      {/* Shared action bar */}
+      <ActionBar context="terminal" onSendData={sendInput} />
     </RNView>
   );
 }
@@ -161,22 +123,5 @@ const styles = StyleSheet.create({
     borderRadius: 18,
     alignItems: 'center',
     justifyContent: 'center',
-  },
-  actions: {
-    flexDirection: 'row',
-    gap: 8,
-  },
-  actionButton: {
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 6,
-    minWidth: 44,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  actionText: {
-    fontSize: 12,
-    fontWeight: '600',
-    fontFamily: 'SpaceMono',
   },
 });

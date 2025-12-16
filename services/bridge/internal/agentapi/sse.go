@@ -241,6 +241,13 @@ func (c *SSEClient) IsConnected() bool {
 	return c.connected
 }
 
+// SetHandler updates the event handler (used when session reconnects)
+func (c *SSEClient) SetHandler(handler EventHandler) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.handler = handler
+}
+
 // Close terminates the SSE connection
 func (c *SSEClient) Close() {
 	log.Printf("[DEBUG] [SSE] Closing connection to port %d", c.port)

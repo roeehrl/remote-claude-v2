@@ -1,6 +1,7 @@
 # Dependencies
 node_modules/
 .pnpm-store/
+package-lock.json
 
 # Build outputs
 dist/
@@ -22,6 +23,15 @@ bin/
 *.out
 vendor/
 
+# Bridge binary
+services/bridge/bridge
+
+# SQLite databases
+*.db
+*.sqlite
+*.sqlite3
+bridge_data/
+
 # IDE
 .vscode/
 .idea/
@@ -38,6 +48,19 @@ Thumbs.db
 .env.local
 .env.*.local
 *.env
+.envrc
+
+# Secrets and credentials
+secrets/
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+credentials.json
+service-account*.json
+*-credentials.json
 
 # Logs
 logs/

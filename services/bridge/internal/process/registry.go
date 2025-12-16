@@ -25,6 +25,12 @@ const (
 	TypeClaude ProcessType = "claude"
 )
 
+// EnvVar represents an environment variable
+type EnvVar struct {
+	Key   string
+	Value string
+}
+
 // Process represents a managed process (shell or Claude)
 type Process struct {
 	ID            string
@@ -33,9 +39,11 @@ type Process struct {
 	PTY           *pty.Session
 	Port          *int        // AgentAPI port (only for Claude)
 	CWD           string
+	Name          *string     // Custom user-defined name
 	StartedAt     time.Time
 	ShellPID      *int        // Shell process PID on remote
 	AgentAPIPID   *int        // AgentAPI server PID (only for Claude)
+	EnvVars       []EnvVar    // Captured environment variables at spawn time
 
 	// AgentAPI clients (only for Claude processes)
 	AgentClient *agentapi.Client
@@ -50,10 +58,11 @@ type Process struct {
 
 // Registry manages all processes across hosts
 type Registry struct {
-	processes     sync.Map // map[processID]*Process
-	hostProcesses sync.Map // map[hostID][]processID
-	portPool      *PortPool
-	mu            sync.Mutex
+	processes      sync.Map // map[processID]*Process
+	hostProcesses  sync.Map // map[hostID][]processID
+	staleProcesses sync.Map // map[hostID][]protocol.StaleProcess
+	portPool       *PortPool
+	mu             sync.Mutex
 }
 
 // PortPool manages port allocation for AgentAPI servers
@@ -97,6 +106,19 @@ func (p *PortPool) Release(port int) {
 	if port >= MinPort && port <= MaxPort {
 		p.ports[port] = false
 		log.Printf("[DEBUG] [PORT] Released port %d", port)
+	}
+}
+
+// MarkInUse marks a port as in use (for existing processes found during reconnect)
+func (p *PortPool) MarkInUse(port int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if port >= MinPort && port <= MaxPort {
+		if !p.ports[port] {
+			p.ports[port] = true
+			log.Printf("[DEBUG] [PORT] Marked port %d as in-use (existing process)", port)
+		}
 	}
 }
 
@@ -221,6 +243,16 @@ func (r *Registry) ReleasePort(port int) {
 	r.portPool.Release(port)
 }
 
+// IsPortInUse checks if a port is currently allocated
+func (r *Registry) IsPortInUse(port int) bool {
+	return r.portPool.IsInUse(port)
+}
+
+// MarkPortInUse marks a port as in use (for existing processes found during reconnect)
+func (r *Registry) MarkPortInUse(port int) {
+	r.portPool.MarkInUse(port)
+}
+
 // ConvertToInfo converts a Process to protocol.ProcessInfo
 func (p *Process) ToInfo() protocol.ProcessInfo {
 	p.mu.Lock()
@@ -232,6 +264,7 @@ func (p *Process) ToInfo() protocol.ProcessInfo {
 		HostID:        p.HostID,
 		Port:          p.Port,
 		CWD:           p.CWD,
+		Name:          p.Name,
 		PtyReady:      p.PtyReady,
 		AgentAPIReady: p.AgentAPIReady,
 		StartedAt:     p.StartedAt.Format(time.RFC3339),
@@ -282,6 +315,40 @@ func (p *Process) SetAgentAPIPID(pid int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.AgentAPIPID = &pid
+}
+
+// SetName sets the custom name for the process
+func (p *Process) SetName(name string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if name == "" {
+		p.Name = nil
+	} else {
+		p.Name = &name
+	}
+	log.Printf("[DEBUG] [PROCESS] Updated process %s name to %q", p.ID, name)
+}
+
+// SetCWD updates the current working directory
+func (p *Process) SetCWD(cwd string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.CWD = cwd
+}
+
+// RefreshCWD queries and updates the current working directory from the PTY session
+func (p *Process) RefreshCWD() {
+	if p.PTY == nil {
+		return
+	}
+	cwd, err := p.PTY.RefreshCWD()
+	if err != nil {
+		log.Printf("[WARN] [PROCESS] Failed to refresh CWD for process %s: %v", p.ID, err)
+		return
+	}
+	p.mu.Lock()
+	p.CWD = cwd
+	p.mu.Unlock()
 }
 
 // Close closes the process and its resources (kills tmux session)
@@ -365,7 +432,7 @@ func (r *Registry) Count() int {
 	return count
 }
 
-// Close closes all processes and cleans up
+// Close closes all processes and cleans up (kills tmux sessions)
 func (r *Registry) Close() {
 	log.Printf("[INFO] [REGISTRY] Closing all processes")
 	r.processes.Range(func(key, value interface{}) bool {
@@ -373,4 +440,81 @@ func (r *Registry) Close() {
 		proc.Close()
 		return true
 	})
+}
+
+// DetachAll detaches from all processes without killing them
+// Tmux sessions continue running on remote hosts and can be reattached later
+func (r *Registry) DetachAll() {
+	log.Printf("[INFO] [REGISTRY] Detaching from all processes (sessions will persist)")
+	r.processes.Range(func(key, value interface{}) bool {
+		proc := value.(*Process)
+		if err := proc.Detach(); err != nil {
+			log.Printf("[WARN] [REGISTRY] Error detaching process %s: %v", proc.ID, err)
+		}
+		return true
+	})
+}
+
+// SetStaleProcesses sets the stale processes for a host
+func (r *Registry) SetStaleProcesses(hostID string, stale []protocol.StaleProcess) {
+	r.staleProcesses.Store(hostID, stale)
+	log.Printf("[DEBUG] [REGISTRY] Set %d stale processes for host %s", len(stale), hostID)
+}
+
+// GetStaleProcesses returns the stale processes for a host
+func (r *Registry) GetStaleProcesses(hostID string) []protocol.StaleProcess {
+	if val, ok := r.staleProcesses.Load(hostID); ok {
+		return val.([]protocol.StaleProcess)
+	}
+	return nil
+}
+
+// GetStaleProcess returns a stale process by its process ID, or nil if not found
+func (r *Registry) GetStaleProcess(hostID string, processID string) *protocol.StaleProcess {
+	val, ok := r.staleProcesses.Load(hostID)
+	if !ok {
+		return nil
+	}
+
+	stale := val.([]protocol.StaleProcess)
+	for i := range stale {
+		if stale[i].ProcessID != nil && *stale[i].ProcessID == processID {
+			return &stale[i]
+		}
+	}
+	return nil
+}
+
+// RemoveStaleProcess removes a stale process by its process ID
+// Returns true if a stale process was removed
+func (r *Registry) RemoveStaleProcess(hostID string, processID string) bool {
+	val, ok := r.staleProcesses.Load(hostID)
+	if !ok {
+		return false
+	}
+
+	stale := val.([]protocol.StaleProcess)
+	newStale := make([]protocol.StaleProcess, 0, len(stale))
+	removed := false
+
+	for _, sp := range stale {
+		if sp.ProcessID != nil && *sp.ProcessID == processID {
+			removed = true
+			continue
+		}
+		newStale = append(newStale, sp)
+	}
+
+	if removed {
+		r.staleProcesses.Store(hostID, newStale)
+		log.Printf("[DEBUG] [REGISTRY] Removed stale process %s from host %s (%d remaining)", processID, hostID, len(newStale))
+	}
+
+	return removed
+}
+
+// ClearStaleProcesses clears all stale processes for a host
+func (r *Registry) ClearStaleProcesses(hostID string) {
+	r.staleProcesses.Delete(hostID)
+	log.Printf("[DEBUG] [REGISTRY] Cleared stale processes for host %s", hostID)
 }

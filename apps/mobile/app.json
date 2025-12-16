@@ -36,7 +36,15 @@
       "favicon": "./assets/images/favicon.png"
     },
     "plugins": [
-      "expo-router"
+      "expo-router",
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "Allow Remote Claude to use the microphone for voice input.",
+          "speechRecognitionPermission": "Allow Remote Claude to use speech recognition for voice commands.",
+          "androidSpeechServicePackages": ["com.google.android.googlequicksearchbox"]
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true
@@ -44,8 +52,9 @@
     "extra": {
       "router": {},
       "eas": {
-        "projectId": "183b00a8-5cf8-494a-96e9-213f356e7447"
+        "projectId": "ba861284-163b-4459-9d4b-3016f65ac51c"
       }
-    }
+    },
+    "owner": "blueguru"
   }
 }

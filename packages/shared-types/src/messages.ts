@@ -14,7 +14,17 @@ export const MessageTypes = {
   AUTH: 'auth',
   AUTH_RESULT: 'auth_result',
 
-  // Host Management
+  // Host Configuration (CRUD - stored in bridge)
+  HOST_CONFIG_LIST: 'host_config_list',
+  HOST_CONFIG_LIST_RESULT: 'host_config_list_result',
+  HOST_CONFIG_CREATE: 'host_config_create',
+  HOST_CONFIG_CREATE_RESULT: 'host_config_create_result',
+  HOST_CONFIG_UPDATE: 'host_config_update',
+  HOST_CONFIG_UPDATE_RESULT: 'host_config_update_result',
+  HOST_CONFIG_DELETE: 'host_config_delete',
+  HOST_CONFIG_DELETE_RESULT: 'host_config_delete_result',
+
+  // Host Connection (runtime)
   HOST_CONNECT: 'host_connect',
   HOST_DISCONNECT: 'host_disconnect',
   HOST_STATUS: 'host_status',
@@ -31,6 +41,7 @@ export const MessageTypes = {
   PROCESS_KILLED: 'process_killed',
   PROCESS_UPDATED: 'process_updated',
   PROCESS_REATTACH: 'process_reattach',
+  PROCESS_RENAME: 'process_rename',
 
   // Claude Conversion
   CLAUDE_START: 'claude_start',
@@ -57,6 +68,30 @@ export const MessageTypes = {
   CHAT_STATUS_RESULT: 'chat_status_result',
   CHAT_HISTORY: 'chat_history',
   CHAT_MESSAGES: 'chat_messages',
+
+  // Environment Variables - Host Level
+  ENV_LIST: 'env_list',
+  ENV_UPDATE: 'env_update',
+  ENV_RESULT: 'env_result',
+  ENV_SET_RC_FILE: 'env_set_rc_file',
+
+  // Environment Variables - Process Level
+  PROCESS_ENV_LIST: 'process_env_list',
+  PROCESS_ENV_RESULT: 'process_env_result',
+
+  // Ports Scanning
+  PORTS_SCAN: 'ports_scan',
+  PORTS_RESULT: 'ports_result',
+
+  // Snippets (global, unrelated to hosts/processes)
+  SNIPPET_LIST: 'snippet_list',
+  SNIPPET_LIST_RESULT: 'snippet_list_result',
+  SNIPPET_CREATE: 'snippet_create',
+  SNIPPET_CREATE_RESULT: 'snippet_create_result',
+  SNIPPET_UPDATE: 'snippet_update',
+  SNIPPET_UPDATE_RESULT: 'snippet_update_result',
+  SNIPPET_DELETE: 'snippet_delete',
+  SNIPPET_DELETE_RESULT: 'snippet_delete_result',
 
   // Error
   ERROR: 'error',
@@ -86,6 +121,7 @@ export interface ProcessInfo {
   hostId: string;
   port?: number;
   cwd: string;
+  name?: string; // Custom user-defined name
   ptyReady: boolean;
   agentApiReady: boolean;
   startedAt: string; // ISO timestamp
@@ -118,17 +154,87 @@ export interface AuthResultPayload {
 }
 
 // ============================================================================
-// Host Management Payloads
+// Host Configuration Payloads (CRUD - stored in bridge)
+// ============================================================================
+
+export type AuthType = 'password' | 'key';
+
+/** SSH host configuration stored in bridge */
+export interface SSHHostConfig {
+  id: string;
+  name: string;
+  host: string;
+  port: number;
+  username: string;
+  authType: AuthType;
+  autoConnect: boolean;
+  createdAt: string; // ISO timestamp
+  updatedAt: string; // ISO timestamp
+  // Note: credentials are NOT included in list results for security
+}
+
+// List all configured hosts
+export interface HostConfigListPayload {
+  // empty - no params needed
+}
+
+export interface HostConfigListResultPayload {
+  hosts: SSHHostConfig[];
+}
+
+// Create a new host
+export interface HostConfigCreatePayload {
+  name: string;
+  host: string;
+  port: number;
+  username: string;
+  authType: AuthType;
+  credential: string; // password or private key
+  autoConnect?: boolean;
+}
+
+export interface HostConfigCreateResultPayload {
+  success: boolean;
+  host?: SSHHostConfig;
+  error?: string;
+}
+
+// Update an existing host
+export interface HostConfigUpdatePayload {
+  id: string;
+  name?: string;
+  host?: string;
+  port?: number;
+  username?: string;
+  authType?: AuthType;
+  credential?: string; // only set if changing credential
+  autoConnect?: boolean;
+}
+
+export interface HostConfigUpdateResultPayload {
+  success: boolean;
+  host?: SSHHostConfig;
+  error?: string;
+}
+
+// Delete a host
+export interface HostConfigDeletePayload {
+  id: string;
+}
+
+export interface HostConfigDeleteResultPayload {
+  success: boolean;
+  id?: string;
+  error?: string;
+}
+
+// ============================================================================
+// Host Connection Payloads (runtime)
 // ============================================================================
 
 export interface HostConnectPayload {
   hostId: string;
-  host: string;
-  port: number;
-  username: string;
-  authType: 'password' | 'key';
-  password?: string;
-  privateKey?: string;
+  // No credentials needed - bridge has them stored
 }
 
 export interface HostDisconnectPayload {
@@ -204,10 +310,16 @@ export interface ProcessReattachPayload {
   processId: string; // Original process ID from tmux session name
 }
 
+export interface ProcessRenamePayload {
+  processId: string;
+  name: string;
+}
+
 export interface ProcessUpdatedPayload {
   id: string;
   type: ProcessType;
   port?: number;
+  name?: string;
   ptyReady: boolean;
   agentApiReady: boolean;
   shellPid?: number;
@@ -220,6 +332,7 @@ export interface ProcessUpdatedPayload {
 
 export interface ClaudeStartPayload {
   processId: string;
+  claudeArgs?: string; // Optional extra arguments for claude command (e.g., "--continue", "-s")
 }
 
 export interface ClaudeKillPayload {
@@ -352,6 +465,136 @@ export interface ChatMessagesPayload {
 }
 
 // ============================================================================
+// Environment Variables Payloads
+// ============================================================================
+
+export interface EnvVar {
+  key: string;
+  value: string;
+}
+
+// Host-level env management
+export interface EnvListPayload {
+  hostId: string;
+}
+
+export interface EnvUpdatePayload {
+  hostId: string;
+  customVars: EnvVar[];
+}
+
+export interface EnvResultPayload {
+  hostId: string;
+  systemVars: EnvVar[];
+  customVars: EnvVar[];
+  rcFile: string;
+  detectedRcFile: string;
+  error?: string;
+}
+
+export interface EnvSetRcFilePayload {
+  hostId: string;
+  rcFile: string;
+}
+
+// Process-level env viewer (read-only)
+export interface ProcessEnvListPayload {
+  processId: string;
+}
+
+export interface ProcessEnvResultPayload {
+  processId: string;
+  vars: EnvVar[];
+  error?: string;
+}
+
+// ============================================================================
+// Ports Scanning Payloads
+// ============================================================================
+
+export interface PortsScanPayload {
+  hostId: string;
+}
+
+export interface PortInfo {
+  port: number;
+  status: 'active' | 'refused' | 'timeout' | 'unknown';
+  processId?: string;        // From DB mapping
+  processName?: string;      // From DB mapping
+  processType?: ProcessType; // From DB mapping
+  // Enriched from netstat/ss/lsof
+  netPid?: number;          // PID from network tool
+  netProcess?: string;      // Process name from network tool
+  netUser?: string;         // User from network tool
+}
+
+export interface PortsResultPayload {
+  hostId: string;
+  ports: PortInfo[];
+  netTool?: string;         // Which tool was used: 'ss', 'netstat', 'lsof', or undefined if none
+  netToolError?: string;    // Error message if no tool available
+  error?: string;
+}
+
+// ============================================================================
+// Snippets Payloads
+// ============================================================================
+
+/** A command snippet saved for quick terminal access */
+export interface Snippet {
+  id: string;
+  name: string;
+  content: string;
+  createdAt: string; // ISO timestamp
+  updatedAt: string; // ISO timestamp
+}
+
+// List all snippets
+export interface SnippetListPayload {
+  // empty - no params needed
+}
+
+export interface SnippetListResultPayload {
+  snippets: Snippet[];
+}
+
+// Create a new snippet
+export interface SnippetCreatePayload {
+  name: string;
+  content: string;
+}
+
+export interface SnippetCreateResultPayload {
+  success: boolean;
+  snippet?: Snippet;
+  error?: string;
+}
+
+// Update an existing snippet
+export interface SnippetUpdatePayload {
+  id: string;
+  name?: string;
+  content?: string;
+}
+
+export interface SnippetUpdateResultPayload {
+  success: boolean;
+  snippet?: Snippet;
+  error?: string;
+}
+
+// Delete a snippet
+export interface SnippetDeletePayload {
+  id: string;
+}
+
+export interface SnippetDeleteResultPayload {
+  success: boolean;
+  id?: string;
+  error?: string;
+}
+
+// ============================================================================
 // Error Payload
 // ============================================================================
 
@@ -382,7 +625,32 @@ export const Messages = {
   authResult: (payload: AuthResultPayload) =>
     createMessage(MessageTypes.AUTH_RESULT, payload),
 
-  // Host
+  // Host Config (CRUD)
+  hostConfigList: () =>
+    createMessage(MessageTypes.HOST_CONFIG_LIST, {}),
+
+  hostConfigListResult: (payload: HostConfigListResultPayload) =>
+    createMessage(MessageTypes.HOST_CONFIG_LIST_RESULT, payload),
+
+  hostConfigCreate: (payload: HostConfigCreatePayload) =>
+    createMessage(MessageTypes.HOST_CONFIG_CREATE, payload),
+
+  hostConfigCreateResult: (payload: HostConfigCreateResultPayload) =>
+    createMessage(MessageTypes.HOST_CONFIG_CREATE_RESULT, payload),
+
+  hostConfigUpdate: (payload: HostConfigUpdatePayload) =>
+    createMessage(MessageTypes.HOST_CONFIG_UPDATE, payload),
+
+  hostConfigUpdateResult: (payload: HostConfigUpdateResultPayload) =>
+    createMessage(MessageTypes.HOST_CONFIG_UPDATE_RESULT, payload),
+
+  hostConfigDelete: (payload: HostConfigDeletePayload) =>
+    createMessage(MessageTypes.HOST_CONFIG_DELETE, payload),
+
+  hostConfigDeleteResult: (payload: HostConfigDeleteResultPayload) =>
+    createMessage(MessageTypes.HOST_CONFIG_DELETE_RESULT, payload),
+
+  // Host Connection (runtime)
   hostConnect: (payload: HostConnectPayload) =>
     createMessage(MessageTypes.HOST_CONNECT, payload),
 
@@ -425,6 +693,9 @@ export const Messages = {
 
   processReattach: (payload: ProcessReattachPayload) =>
     createMessage(MessageTypes.PROCESS_REATTACH, payload),
+
+  processRename: (payload: ProcessRenamePayload) =>
+    createMessage(MessageTypes.PROCESS_RENAME, payload),
 
   // Claude conversion
   claudeStart: (payload: ClaudeStartPayload) =>
@@ -483,6 +754,58 @@ export const Messages = {
 
   chatMessages: (payload: ChatMessagesPayload) =>
     createMessage(MessageTypes.CHAT_MESSAGES, payload),
+
+  // Environment Variables - Host Level
+  envList: (payload: EnvListPayload) =>
+    createMessage(MessageTypes.ENV_LIST, payload),
+
+  envUpdate: (payload: EnvUpdatePayload) =>
+    createMessage(MessageTypes.ENV_UPDATE, payload),
+
+  envResult: (payload: EnvResultPayload) =>
+    createMessage(MessageTypes.ENV_RESULT, payload),
+
+  envSetRcFile: (payload: EnvSetRcFilePayload) =>
+    createMessage(MessageTypes.ENV_SET_RC_FILE, payload),
+
+  // Environment Variables - Process Level
+  processEnvList: (payload: ProcessEnvListPayload) =>
+    createMessage(MessageTypes.PROCESS_ENV_LIST, payload),
+
+  processEnvResult: (payload: ProcessEnvResultPayload) =>
+    createMessage(MessageTypes.PROCESS_ENV_RESULT, payload),
+
+  // Ports Scanning
+  portsScan: (payload: PortsScanPayload) =>
+    createMessage(MessageTypes.PORTS_SCAN, payload),
+
+  portsResult: (payload: PortsResultPayload) =>
+    createMessage(MessageTypes.PORTS_RESULT, payload),
+
+  // Snippets
+  snippetList: () =>
+    createMessage(MessageTypes.SNIPPET_LIST, {}),
+
+  snippetListResult: (payload: SnippetListResultPayload) =>
+    createMessage(MessageTypes.SNIPPET_LIST_RESULT, payload),
+
+  snippetCreate: (payload: SnippetCreatePayload) =>
+    createMessage(MessageTypes.SNIPPET_CREATE, payload),
+
+  snippetCreateResult: (payload: SnippetCreateResultPayload) =>
+    createMessage(MessageTypes.SNIPPET_CREATE_RESULT, payload),
+
+  snippetUpdate: (payload: SnippetUpdatePayload) =>
+    createMessage(MessageTypes.SNIPPET_UPDATE, payload),
+
+  snippetUpdateResult: (payload: SnippetUpdateResultPayload) =>
+    createMessage(MessageTypes.SNIPPET_UPDATE_RESULT, payload),
+
+  snippetDelete: (payload: SnippetDeletePayload) =>
+    createMessage(MessageTypes.SNIPPET_DELETE, payload),
+
+  snippetDeleteResult: (payload: SnippetDeleteResultPayload) =>
+    createMessage(MessageTypes.SNIPPET_DELETE_RESULT, payload),
 
   // Error
   error: (payload: ErrorPayload) =>

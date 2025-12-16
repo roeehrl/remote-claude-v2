@@ -204,14 +204,14 @@ export default function TerminalXterm({
     <div
       ref={containerRef}
       style={{
-        // Use absolute positioning to fill the entire viewport in the WebView
+        // Use absolute positioning to fill the container
+        // Note: Don't use 100vw/100vh - in React Native WebViews, viewport units
+        // can include safe area insets and behave differently than on web
         position: 'absolute',
         top: 0,
         left: 0,
         right: 0,
         bottom: 0,
-        width: '100vw',
-        height: '100vh',
         backgroundColor: isDarkMode ? darkTerminalTheme.background : lightTerminalTheme.background,
         overflow: 'hidden',
       }}

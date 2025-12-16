@@ -11,32 +11,6 @@ export interface BridgeConfig {
 }
 
 // ============================================================================
-// SSH Host Configuration
-// ============================================================================
-
-export type AuthType = 'password' | 'key';
-
-export interface SSHHostConfig {
-  id: string;
-  name: string; // Display name, e.g., "My Dev Server"
-  host: string; // SSH host, e.g., "192.168.1.100"
-  port: number; // SSH port, default 22
-  username: string;
-  authType: AuthType;
-  password?: string;
-  privateKey?: string;
-}
-
-// ============================================================================
-// Full App Configuration
-// ============================================================================
-
-export interface AppConfig {
-  bridge: BridgeConfig;
-  sshHosts: SSHHostConfig[];
-}
-
-// ============================================================================
 // Defaults
 // ============================================================================
 

@@ -22,7 +22,16 @@ import {
   ProcessKilledPayload,
   ProcessUpdatedPayload,
   HostRequirementsResultPayload,
+  ErrorPayload,
+  EnvVar,
+  EnvResultPayload,
+  SSHHostConfig,
+  HostConfigListResultPayload,
+  HostConfigCreateResultPayload,
+  HostConfigUpdateResultPayload,
+  HostConfigDeleteResultPayload,
 } from '@remote-claude/shared-types';
+import { useToastStore } from '@/stores';
 
 // ============================================================================
 // Types
@@ -43,6 +52,12 @@ export interface ConnectedHost {
   error?: string;
   requirements?: HostRequirements;
   requirementsChecking?: boolean;
+  // Environment variables
+  envSystemVars?: EnvVar[];
+  envCustomVars?: EnvVar[];
+  envRcFile?: string;
+  envDetectedRcFile?: string;
+  envLoading?: boolean;
 }
 
 interface BridgeContextValue {
@@ -59,6 +74,30 @@ interface BridgeContextValue {
   sendMessage: <T>(message: Message<T>) => void;
   addMessageHandler: (type: MessageType, handler: MessageHandler) => () => void;
 
+  // Configured hosts (stored in bridge - CRUD)
+  configuredHosts: SSHHostConfig[];
+  configuredHostsLoading: boolean;
+  refreshHosts: () => void;
+  createHost: (host: {
+    name: string;
+    host: string;
+    port: number;
+    username: string;
+    authType: 'password' | 'key';
+    credential: string;
+    autoConnect?: boolean;
+  }) => void;
+  updateHost: (id: string, updates: {
+    name?: string;
+    host?: string;
+    port?: number;
+    username?: string;
+    authType?: 'password' | 'key';
+    credential?: string;
+    autoConnect?: boolean;
+  }) => void;
+  deleteHost: (id: string) => void;
+
   // Server state (read-only, received from bridge)
   hosts: Map<string, ConnectedHost>;
 
@@ -71,6 +110,7 @@ interface BridgeContextValue {
   setHostDisconnected: (hostId: string) => void;
   setHostError: (hostId: string, error: string) => void;
   setHostRequirementsChecking: (hostId: string, checking: boolean) => void;
+  setHostEnvLoading: (hostId: string, loading: boolean) => void;
 }
 
 interface BridgeProviderProps {
@@ -117,6 +157,10 @@ export function BridgeProvider({
   const [connectionState, setConnectionState] = useState<ConnectionState>('disconnected');
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [reconnectToken, setReconnectToken] = useState<string | null>(null);
+
+  // Configured hosts (stored in bridge)
+  const [configuredHosts, setConfiguredHosts] = useState<SSHHostConfig[]>([]);
+  const [configuredHostsLoading, setConfiguredHostsLoading] = useState(false);
 
   // Server state (hosts and processes - received from bridge)
   const [hosts, setHosts] = useState<Map<string, ConnectedHost>>(new Map());
@@ -170,6 +214,12 @@ export function BridgeProvider({
       setReconnectToken(payload.reconnectToken ?? null);
       setConnectionState('connected');
       reconnectAttemptRef.current = 0;
+
+      // Request configured hosts from bridge
+      setConfiguredHostsLoading(true);
+      const hostListMsg = Messages.hostConfigList();
+      log('DEBUG', 'BRIDGE', `Sending: ${hostListMsg.type}`);
+      wsRef.current?.send(JSON.stringify(hostListMsg));
     } else {
       log('ERROR', 'BRIDGE', `Authentication failed: ${payload.error}`);
       // Don't set disconnected - let the connection close handler do that
@@ -402,6 +452,17 @@ export function BridgeProvider({
     });
   }, []);
 
+  const setHostEnvLoading = useCallback((hostId: string, loading: boolean) => {
+    setHosts(prev => {
+      const newHosts = new Map(prev);
+      const existing = newHosts.get(hostId);
+      if (existing) {
+        newHosts.set(hostId, { ...existing, envLoading: loading });
+      }
+      return newHosts;
+    });
+  }, []);
+
   const addProcess = useCallback((process: ProcessInfo) => {
     setHosts(prev => {
       const newHosts = new Map(prev);
@@ -428,6 +489,7 @@ export function BridgeProvider({
             ...updatedProcesses[processIndex],
             type: update.type,
             port: update.port,
+            name: update.name,
             ptyReady: update.ptyReady,
             agentApiReady: update.agentApiReady,
             shellPid: update.shellPid,
@@ -466,12 +528,81 @@ export function BridgeProvider({
   }, []);
 
   // ============================================================================
+  // Host Configuration Methods (CRUD)
+  // ============================================================================
+
+  const refreshHosts = useCallback(() => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    setConfiguredHostsLoading(true);
+    const msg = Messages.hostConfigList();
+    log('DEBUG', 'BRIDGE', `Sending: ${msg.type}`);
+    wsRef.current.send(JSON.stringify(msg));
+  }, []);
+
+  const createHost = useCallback((host: {
+    name: string;
+    host: string;
+    port: number;
+    username: string;
+    authType: 'password' | 'key';
+    credential: string;
+    autoConnect?: boolean;
+  }) => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    const msg = Messages.hostConfigCreate({
+      name: host.name,
+      host: host.host,
+      port: host.port,
+      username: host.username,
+      authType: host.authType,
+      credential: host.credential,
+      autoConnect: host.autoConnect,
+    });
+    log('DEBUG', 'BRIDGE', `Sending: ${msg.type}`, { name: host.name });
+    wsRef.current.send(JSON.stringify(msg));
+  }, []);
+
+  const updateHost = useCallback((id: string, updates: {
+    name?: string;
+    host?: string;
+    port?: number;
+    username?: string;
+    authType?: 'password' | 'key';
+    credential?: string;
+    autoConnect?: boolean;
+  }) => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    const msg = Messages.hostConfigUpdate({ id, ...updates });
+    log('DEBUG', 'BRIDGE', `Sending: ${msg.type}`, { id });
+    wsRef.current.send(JSON.stringify(msg));
+  }, []);
+
+  const deleteHost = useCallback((id: string) => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    const msg = Messages.hostConfigDelete({ id });
+    log('DEBUG', 'BRIDGE', `Sending: ${msg.type}`, { id });
+    wsRef.current.send(JSON.stringify(msg));
+  }, []);
+
+  // ============================================================================
   // Server State Message Handlers
   // ============================================================================
 
+  // Toast notifications for errors
+  const toastError = useToastStore(state => state.error);
+  const toastWarning = useToastStore(state => state.warning);
+
   // Handle host status updates
   useEffect(() => {
-    return addMessageHandler(MessageTypes.HOST_STATUS, (msg: Message<HostStatusPayload>) => {
+    const handler = (msg: Message<HostStatusPayload>) => {
       const payload = msg.payload;
       if (payload.connected) {
         setHostConnected(
@@ -480,45 +611,162 @@ export function BridgeProvider({
           payload.staleProcesses ?? [],
           payload.requirements
         );
+        // Show warning if there are stale processes
+        const staleCount = payload.staleProcesses?.length ?? 0;
+        if (staleCount > 0) {
+          toastWarning(
+            'Stale Sessions Found',
+            `${staleCount} detached session${staleCount > 1 ? 's' : ''} need${staleCount > 1 ? '' : 's'} reattachment`
+          );
+        }
       } else if (payload.error) {
         setHostError(payload.hostId, payload.error);
+        toastError('Host Connection Failed', payload.error);
       } else {
         setHostDisconnected(payload.hostId);
       }
-    });
-  }, [addMessageHandler, setHostConnected, setHostError, setHostDisconnected]);
+    };
+    return addMessageHandler(MessageTypes.HOST_STATUS, handler as MessageHandler);
+  }, [addMessageHandler, setHostConnected, setHostError, setHostDisconnected, toastWarning, toastError]);
 
   // Handle requirements result
   useEffect(() => {
-    return addMessageHandler(MessageTypes.HOST_REQUIREMENTS_RESULT, (msg: Message<HostRequirementsResultPayload>) => {
+    const handler = (msg: Message<HostRequirementsResultPayload>) => {
       const { hostId, requirements, error } = msg.payload;
       setHostRequirementsChecking(hostId, false);
       if (!error && requirements) {
         setHostRequirements(hostId, requirements);
       }
-    });
+    };
+    return addMessageHandler(MessageTypes.HOST_REQUIREMENTS_RESULT, handler as MessageHandler);
   }, [addMessageHandler, setHostRequirements, setHostRequirementsChecking]);
 
   // Handle process created
   useEffect(() => {
-    return addMessageHandler(MessageTypes.PROCESS_CREATED, (msg: Message<ProcessCreatedPayload>) => {
+    const handler = (msg: Message<ProcessCreatedPayload>) => {
       addProcess(msg.payload.process);
-    });
+    };
+    return addMessageHandler(MessageTypes.PROCESS_CREATED, handler as MessageHandler);
   }, [addMessageHandler, addProcess]);
 
   // Handle process killed
   useEffect(() => {
-    return addMessageHandler(MessageTypes.PROCESS_KILLED, (msg: Message<ProcessKilledPayload>) => {
+    const handler = (msg: Message<ProcessKilledPayload>) => {
       removeProcess(msg.payload.processId);
-    });
+    };
+    return addMessageHandler(MessageTypes.PROCESS_KILLED, handler as MessageHandler);
   }, [addMessageHandler, removeProcess]);
 
   // Handle process updated
   useEffect(() => {
-    return addMessageHandler(MessageTypes.PROCESS_UPDATED, (msg: Message<ProcessUpdatedPayload>) => {
+    const handler = (msg: Message<ProcessUpdatedPayload>) => {
       updateProcess(msg.payload);
-    });
+    };
+    return addMessageHandler(MessageTypes.PROCESS_UPDATED, handler as MessageHandler);
   }, [addMessageHandler, updateProcess]);
+
+  // Handle env result (host-level)
+  useEffect(() => {
+    const handler = (msg: Message<EnvResultPayload>) => {
+      const { hostId, systemVars, customVars, rcFile, detectedRcFile, error } = msg.payload;
+      setHosts(prev => {
+        const newHosts = new Map(prev);
+        const existing = newHosts.get(hostId);
+        if (existing) {
+          newHosts.set(hostId, {
+            ...existing,
+            envSystemVars: systemVars,
+            envCustomVars: customVars,
+            envRcFile: rcFile,
+            envDetectedRcFile: detectedRcFile,
+            envLoading: false,
+          });
+        }
+        return newHosts;
+      });
+      if (error) {
+        toastError('Environment Error', error);
+      }
+    };
+    return addMessageHandler(MessageTypes.ENV_RESULT, handler as MessageHandler);
+  }, [addMessageHandler, toastError]);
+
+  // Handle error messages from bridge
+  useEffect(() => {
+    const handler = (msg: Message<ErrorPayload>) => {
+      const { code, message } = msg.payload;
+      log('WARN', 'BRIDGE', `Error from bridge: [${code}] ${message}`);
+
+      // Map error codes to user-friendly titles
+      const errorTitles: Record<string, string> = {
+        'PTY_ERROR': 'Terminal Error',
+        'SSH_ERROR': 'Connection Error',
+        'AUTH_ERROR': 'Authentication Error',
+        'PROCESS_ERROR': 'Process Error',
+        'ATTACH_ERROR': 'Attach Error',
+        'REATTACH_ERROR': 'Reattach Error',
+      };
+
+      const title = errorTitles[code] || 'Error';
+      toastError(title, message);
+    };
+    return addMessageHandler(MessageTypes.ERROR, handler as MessageHandler);
+  }, [addMessageHandler, toastError]);
+
+  // Handle host config list result
+  useEffect(() => {
+    const handler = (msg: Message<HostConfigListResultPayload>) => {
+      log('DEBUG', 'BRIDGE', `Received host config list: ${msg.payload.hosts.length} hosts`);
+      setConfiguredHosts(msg.payload.hosts);
+      setConfiguredHostsLoading(false);
+    };
+    return addMessageHandler(MessageTypes.HOST_CONFIG_LIST_RESULT, handler as MessageHandler);
+  }, [addMessageHandler]);
+
+  // Handle host config create result
+  const toastSuccess = useToastStore(state => state.success);
+  useEffect(() => {
+    const handler = (msg: Message<HostConfigCreateResultPayload>) => {
+      if (msg.payload.success && msg.payload.host) {
+        log('INFO', 'BRIDGE', `Host created: ${msg.payload.host.id}`);
+        setConfiguredHosts(prev => [...prev, msg.payload.host!]);
+        toastSuccess('Host Created', `${msg.payload.host.name} has been added`);
+      } else if (msg.payload.error) {
+        toastError('Failed to Create Host', msg.payload.error);
+      }
+    };
+    return addMessageHandler(MessageTypes.HOST_CONFIG_CREATE_RESULT, handler as MessageHandler);
+  }, [addMessageHandler, toastSuccess, toastError]);
+
+  // Handle host config update result
+  useEffect(() => {
+    const handler = (msg: Message<HostConfigUpdateResultPayload>) => {
+      if (msg.payload.success && msg.payload.host) {
+        log('INFO', 'BRIDGE', `Host updated: ${msg.payload.host.id}`);
+        setConfiguredHosts(prev =>
+          prev.map(h => h.id === msg.payload.host!.id ? msg.payload.host! : h)
+        );
+        toastSuccess('Host Updated', `${msg.payload.host.name} has been updated`);
+      } else if (msg.payload.error) {
+        toastError('Failed to Update Host', msg.payload.error);
+      }
+    };
+    return addMessageHandler(MessageTypes.HOST_CONFIG_UPDATE_RESULT, handler as MessageHandler);
+  }, [addMessageHandler, toastSuccess, toastError]);
+
+  // Handle host config delete result
+  useEffect(() => {
+    const handler = (msg: Message<HostConfigDeleteResultPayload>) => {
+      if (msg.payload.success && msg.payload.id) {
+        log('INFO', 'BRIDGE', `Host deleted: ${msg.payload.id}`);
+        setConfiguredHosts(prev => prev.filter(h => h.id !== msg.payload.id));
+        toastSuccess('Host Deleted', 'Host has been removed');
+      } else if (msg.payload.error) {
+        toastError('Failed to Delete Host', msg.payload.error);
+      }
+    };
+    return addMessageHandler(MessageTypes.HOST_CONFIG_DELETE_RESULT, handler as MessageHandler);
+  }, [addMessageHandler, toastSuccess, toastError]);
 
   // ============================================================================
   // Auto-connect on mount
@@ -548,6 +796,14 @@ export function BridgeProvider({
     sendMessage,
     addMessageHandler,
 
+    // Configured hosts (stored in bridge - CRUD)
+    configuredHosts,
+    configuredHostsLoading,
+    refreshHosts,
+    createHost,
+    updateHost,
+    deleteHost,
+
     // Server state (read-only)
     hosts,
 
@@ -560,6 +816,7 @@ export function BridgeProvider({
     setHostDisconnected,
     setHostError,
     setHostRequirementsChecking,
+    setHostEnvLoading,
   };
 
   return (

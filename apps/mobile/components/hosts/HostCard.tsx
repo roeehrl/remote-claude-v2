@@ -1,10 +1,9 @@
 import React, { useState } from 'react';
-import { StyleSheet, Pressable, View as RNView, ActivityIndicator } from 'react-native';
+import { StyleSheet, Pressable, View as RNView, ActivityIndicator, ScrollView } from 'react-native';
 import { Text, View } from '@/components/Themed';
 import { useThemeColors } from '@/providers/ThemeProvider';
-import { SSHHost } from '@/stores/settingsStore';
-import { ConnectedHost, HostConnectionState } from '@/providers/BridgeProvider';
-import { ProcessInfo, StaleProcess } from '@remote-claude/shared-types';
+import { ConnectedHost } from '@/providers/BridgeProvider';
+import { ProcessInfo, StaleProcess, SSHHostConfig } from '@remote-claude/shared-types';
 import { ProcessCard } from './ProcessCard';
 import { StaleProcessCard } from './StaleProcessCard';
 import { RequirementsBanner } from './RequirementsBanner';
@@ -15,7 +14,7 @@ import { Ionicons } from '@expo/vector-icons';
 // ============================================================================
 
 interface HostCardProps {
-  host: SSHHost;
+  host: SSHHostConfig;
   connectedHost?: ConnectedHost;
   selectedProcessId: string | null;
   onConnect: () => void;
@@ -23,11 +22,14 @@ interface HostCardProps {
   onNewShell: () => void;
   onSelectProcess: (processId: string) => void;
   onStartClaude: (processId: string) => void;
+  onStartClaudeLongPress?: (processId: string) => void;
   onKillClaude: (processId: string) => void;
   onKillProcess: (processId: string) => void;
   onKillStaleProcess: (stale: StaleProcess) => void;
   onReattachStaleProcess: (stale: StaleProcess) => void;
   onRefreshRequirements: () => void;
+  onEnvVars: () => void;
+  onPorts: () => void;
 }
 
 // ============================================================================
@@ -43,11 +45,14 @@ export function HostCard({
   onNewShell,
   onSelectProcess,
   onStartClaude,
+  onStartClaudeLongPress,
   onKillClaude,
   onKillProcess,
   onKillStaleProcess,
   onReattachStaleProcess,
   onRefreshRequirements,
+  onEnvVars,
+  onPorts,
 }: HostCardProps) {
   const colors = useThemeColors();
   const [expanded, setExpanded] = useState(true);
@@ -138,7 +143,12 @@ export function HostCard({
           )}
 
           {/* Connection Controls */}
-          <RNView style={styles.controls}>
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            style={styles.controlsScroll}
+            contentContainerStyle={styles.controlsContent}
+          >
             {!isConnected && !isConnecting && (
               <Pressable
                 style={[styles.controlButton, { backgroundColor: colors.primary }]}
@@ -160,6 +170,22 @@ export function HostCard({
                 </Pressable>
 
                 <Pressable
+                  style={[styles.controlButton, { backgroundColor: colors.success }]}
+                  onPress={onEnvVars}
+                >
+                  <Ionicons name="key-outline" size={16} color="#fff" />
+                  <Text style={styles.controlButtonText}>Env Vars</Text>
+                </Pressable>
+
+                <Pressable
+                  style={[styles.controlButton, { backgroundColor: colors.warning }]}
+                  onPress={onPorts}
+                >
+                  <Ionicons name="radio-outline" size={16} color="#fff" />
+                  <Text style={styles.controlButtonText}>Ports</Text>
+                </Pressable>
+
+                <Pressable
                   style={[styles.controlButton, { backgroundColor: colors.error }]}
                   onPress={onDisconnect}
                 >
@@ -178,7 +204,7 @@ export function HostCard({
                 <Text style={styles.controlButtonText}>Cancel</Text>
               </Pressable>
             )}
-          </RNView>
+          </ScrollView>
 
           {/* Process List */}
           {isConnected && processes.length > 0 && (
@@ -194,6 +220,7 @@ export function HostCard({
                   canStartClaude={canStartClaude}
                   onSelect={() => onSelectProcess(process.id)}
                   onStartClaude={() => onStartClaude(process.id)}
+                  onStartClaudeLongPress={onStartClaudeLongPress ? () => onStartClaudeLongPress(process.id) : undefined}
                   onKillClaude={() => onKillClaude(process.id)}
                   onKill={() => onKillProcess(process.id)}
                 />
@@ -290,10 +317,14 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingBottom: 12,
   },
-  controls: {
+  controlsScroll: {
+    marginBottom: 12,
+    marginHorizontal: -12, // Extend to card edges
+  },
+  controlsContent: {
     flexDirection: 'row',
     gap: 8,
-    marginBottom: 12,
+    paddingHorizontal: 12, // Match content padding
   },
   controlButton: {
     flexDirection: 'row',

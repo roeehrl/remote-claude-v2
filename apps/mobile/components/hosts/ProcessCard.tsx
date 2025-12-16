@@ -1,5 +1,5 @@
 import React from 'react';
-import { StyleSheet, Pressable, View as RNView } from 'react-native';
+import { StyleSheet, Pressable, View as RNView, Text as RNText } from 'react-native';
 import { Text, View } from '@/components/Themed';
 import { useThemeColors } from '@/providers/ThemeProvider';
 import { ProcessInfo } from '@remote-claude/shared-types';
@@ -15,6 +15,7 @@ interface ProcessCardProps {
   canStartClaude?: boolean; // Whether Claude/AgentAPI are installed on host
   onSelect: () => void;
   onStartClaude: () => void;
+  onStartClaudeLongPress?: () => void; // Long press to show options modal
   onKillClaude: () => void;
   onKill: () => void;
 }
@@ -29,6 +30,7 @@ export function ProcessCard({
   canStartClaude = true,
   onSelect,
   onStartClaude,
+  onStartClaudeLongPress,
   onKillClaude,
   onKill,
 }: ProcessCardProps) {
@@ -74,7 +76,7 @@ export function ProcessCard({
             color={isClaude ? colors.chatUserBubble : colors.terminalText}
           />
           <Text style={[styles.type, { color: colors.textSecondary }]}>
-            {isClaude ? 'Claude' : 'Shell'}
+            {process.name || (isClaude ? 'Claude' : 'Shell')}
           </Text>
         </RNView>
         <RNView style={styles.statusContainer}>
@@ -85,30 +87,35 @@ export function ProcessCard({
         </RNView>
       </RNView>
 
+      {/* Process ID */}
+      <Text style={[styles.processId, { color: colors.textSecondary }]} numberOfLines={1}>
+        ID: {process.id}
+      </Text>
+
       {/* Info Row */}
       <RNView style={styles.infoRow}>
         <Text style={[styles.cwd, { color: colors.text }]} numberOfLines={1}>
-          {process.cwd}
+          {process.cwd || '~'}
         </Text>
         <Text style={[styles.time, { color: colors.textSecondary }]}>
           {formatTime(process.startedAt)}
         </Text>
       </RNView>
 
-      {/* PID Info */}
-      <RNView style={styles.pidRow}>
-        <Text style={[styles.pidText, { color: colors.textSecondary }]}>
-          PID: {process.shellPid || '—'}
+      {/* Process Details */}
+      <RNView style={styles.detailsRow}>
+        <Text style={[styles.detailText, { color: colors.textSecondary }]}>
+          Shell PID: {process.shellPid ?? '—'}
         </Text>
-        {isClaude && process.agentApiPid && (
-          <Text style={[styles.pidText, { color: colors.textSecondary }]}>
-            AgentAPI PID: {process.agentApiPid}
-          </Text>
-        )}
-        {isClaude && process.port && (
-          <Text style={[styles.pidText, { color: colors.textSecondary }]}>
-            Port: {process.port}
-          </Text>
+        {isClaude && (
+          <>
+            <Text style={[styles.detailText, { color: colors.textSecondary }]}>
+              AgentAPI PID: {process.agentApiPid ?? '—'}
+            </Text>
+            <Text style={[styles.detailText, { color: colors.textSecondary }]}>
+              Port: {process.port ?? '—'}
+            </Text>
+          </>
         )}
       </RNView>
 
@@ -118,9 +125,13 @@ export function ProcessCard({
           <Pressable
             style={[styles.actionButton, { backgroundColor: colors.primary }]}
             onPress={onStartClaude}
+            onLongPress={onStartClaudeLongPress}
+            delayLongPress={500}
           >
-            <Ionicons name="flash" size={14} color="#fff" />
-            <Text style={styles.actionText}>Claude</Text>
+            <RNView style={styles.actionButtonContent} pointerEvents="none">
+              <Ionicons name="flash" size={14} color="#fff" />
+              <RNText style={styles.actionText}>Claude</RNText>
+            </RNView>
           </Pressable>
         )}
 
@@ -191,6 +202,11 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: 4,
   },
+  processId: {
+    fontSize: 10,
+    fontFamily: 'SpaceMono',
+    marginBottom: 4,
+  },
   cwd: {
     fontSize: 12,
     fontFamily: 'SpaceMono',
@@ -200,14 +216,14 @@ const styles = StyleSheet.create({
   time: {
     fontSize: 11,
   },
-  pidRow: {
+  detailsRow: {
     flexDirection: 'row',
     flexWrap: 'wrap',
     gap: 12,
     marginTop: 4,
     marginBottom: 4,
   },
-  pidText: {
+  detailText: {
     fontSize: 11,
     fontFamily: 'SpaceMono',
   },
@@ -223,6 +239,11 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     paddingVertical: 6,
     borderRadius: 6,
+    gap: 4,
+  },
+  actionButtonContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
     gap: 4,
   },
   actionText: {

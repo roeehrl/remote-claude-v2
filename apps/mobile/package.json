@@ -12,7 +12,8 @@
     "test": "jest",
     "test:alignment": "jest --testPathPattern=alignment",
     "lint": "eslint . --ext .ts,.tsx",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "eas-build-post-install": "cd ../.. && pnpm run build:shared-types"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.0.3",
@@ -24,12 +25,15 @@
     "@xterm/xterm": "^5.5.0",
     "expo": "~54.0.27",
     "expo-constants": "~18.0.11",
+    "expo-dev-client": "~6.0.20",
     "expo-document-picker": "^14.0.8",
     "expo-file-system": "^19.0.20",
     "expo-font": "~14.0.10",
     "expo-linking": "~8.0.10",
     "expo-router": "~6.0.17",
     "expo-secure-store": "^15.0.8",
+    "expo-speech": "~14.0.8",
+    "expo-speech-recognition": "^0.2.25",
     "expo-splash-screen": "~31.0.12",
     "expo-status-bar": "~3.0.9",
     "expo-web-browser": "~15.0.10",

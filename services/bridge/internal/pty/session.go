@@ -445,6 +445,47 @@ func (s *Session) SetCWD(cwd string) {
 	s.cwd = cwd
 }
 
+// RefreshCWD queries the current working directory from the tmux pane
+// and updates the internal cwd field. Returns the current CWD.
+func (s *Session) RefreshCWD() (string, error) {
+	s.mu.Lock()
+	sshClient := s.sshClient
+	tmuxName := s.TmuxName
+	s.mu.Unlock()
+
+	if sshClient == nil {
+		return "", fmt.Errorf("SSH client not available")
+	}
+
+	session, err := sshClient.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("failed to create SSH session: %w", err)
+	}
+	defer session.Close()
+
+	// Get the current working directory of the shell in the tmux pane
+	// #{pane_current_path} gives us the CWD of the process in the active pane
+	cmd := fmt.Sprintf("tmux list-panes -t %s -F '#{pane_current_path}' 2>/dev/null | head -1", tmuxName)
+	output, err := session.Output(cmd)
+	if err != nil {
+		return "", fmt.Errorf("failed to get CWD: %w", err)
+	}
+
+	// Trim whitespace from output
+	cwd := string(output)
+	if len(cwd) > 0 && cwd[len(cwd)-1] == '\n' {
+		cwd = cwd[:len(cwd)-1]
+	}
+
+	// Update internal state
+	s.mu.Lock()
+	s.cwd = cwd
+	s.mu.Unlock()
+
+	log.Printf("[DEBUG] [PTY] Refreshed CWD for session %s: %s", s.ID, cwd)
+	return cwd, nil
+}
+
 // GetTmuxName returns the tmux session name
 func (s *Session) GetTmuxName() string {
 	return s.TmuxName

@@ -25,7 +25,20 @@ try {
 
 import { Text } from '@/components/Themed';
 import { useTheme, useThemeColors } from '@/providers';
-import { useSettingsStore, SSHHost, storeHostCredential } from '@/stores/settingsStore';
+import { useBridge, useConnectionState, useMessageHandler } from '@/providers/BridgeProvider';
+import { useSettingsStore } from '@/stores/settingsStore';
+import { SnippetsModal } from '@/components/terminal';
+import {
+  SSHHostConfig,
+  Snippet,
+  Messages,
+  MessageTypes,
+  SnippetListResultPayload,
+  SnippetCreateResultPayload,
+  SnippetUpdateResultPayload,
+  SnippetDeleteResultPayload,
+  Message,
+} from '@remote-claude/shared-types';
 
 // ============================================================================
 // Section Header Component
@@ -85,7 +98,7 @@ function SettingsRow({ label, value, onPress, rightElement, isDestructive }: Set
 // ============================================================================
 
 interface HostRowProps {
-  host: SSHHost;
+  host: SSHHostConfig;
   onEdit: () => void;
   onDelete: () => void;
 }
@@ -107,25 +120,34 @@ function HostRow({ host, onEdit, onDelete }: HostRowProps) {
   return (
     <View style={[styles.hostRow, { borderBottomColor: colors.border }]}>
       <TouchableOpacity style={styles.hostInfo} onPress={onEdit} activeOpacity={0.7}>
-        <Text style={styles.hostName}>{host.name}</Text>
+        <Text style={[styles.hostName, { color: colors.text }]}>{host.name}</Text>
         <Text style={[styles.hostDetails, { color: colors.textSecondary }]}>
           {host.username}@{host.host}:{host.port}
         </Text>
       </TouchableOpacity>
       <TouchableOpacity onPress={handleDelete} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
-        <Text style={{ color: colors.error, fontSize: 18 }}>✕</Text>
+        <Text style={{ color: colors.error, fontSize: 18 }}>x</Text>
       </TouchableOpacity>
     </View>
   );
 }
 
 // ============================================================================
-// Add/Edit Host Modal (inline for now)
+// Add/Edit Host Form
 // ============================================================================
 
+interface HostFormData {
+  name: string;
+  host: string;
+  port: number;
+  username: string;
+  authType: 'password' | 'key';
+  autoConnect: boolean;
+}
+
 interface HostFormProps {
-  host?: SSHHost;
-  onSave: (host: Omit<SSHHost, 'id'>, credential: string) => void;
+  host?: SSHHostConfig;
+  onSave: (data: HostFormData, credential: string) => void;
   onCancel: () => void;
 }
 
@@ -135,7 +157,7 @@ function HostForm({ host, onSave, onCancel }: HostFormProps) {
   const [hostAddress, setHostAddress] = useState(host?.host ?? '');
   const [port, setPort] = useState(host?.port?.toString() ?? '22');
   const [username, setUsername] = useState(host?.username ?? '');
-  const [authType, setAuthType] = useState<'password' | 'key'>(host?.authType ?? 'password');
+  const [authType, setAuthType] = useState<'password' | 'key'>(host?.authType as 'password' | 'key' ?? 'password');
   const [autoConnect, setAutoConnect] = useState(host?.autoConnect ?? false);
   const [credential, setCredential] = useState('');
 
@@ -164,7 +186,7 @@ function HostForm({ host, onSave, onCancel }: HostFormProps) {
 
   return (
     <View style={[styles.form, { backgroundColor: colors.card }]}>
-      <Text style={styles.formTitle}>{host ? 'Edit Host' : 'Add Host'}</Text>
+      <Text style={[styles.formTitle, { color: colors.text }]}>{host ? 'Edit Host' : 'Add Host'}</Text>
 
       <Text style={[styles.inputLabel, { color: colors.textSecondary }]}>Name *</Text>
       <TextInput
@@ -217,7 +239,7 @@ function HostForm({ host, onSave, onCancel }: HostFormProps) {
           ]}
           onPress={() => setAuthType('password')}
         >
-          <Text style={[styles.authTypeText, authType === 'password' && { color: '#fff' }]}>
+          <Text style={[styles.authTypeText, { color: authType === 'password' ? '#fff' : colors.text }]}>
             Password
           </Text>
         </TouchableOpacity>
@@ -229,7 +251,7 @@ function HostForm({ host, onSave, onCancel }: HostFormProps) {
           ]}
           onPress={() => setAuthType('key')}
         >
-          <Text style={[styles.authTypeText, authType === 'key' && { color: '#fff' }]}>
+          <Text style={[styles.authTypeText, { color: authType === 'key' ? '#fff' : colors.text }]}>
             Private Key
           </Text>
         </TouchableOpacity>
@@ -241,7 +263,7 @@ function HostForm({ host, onSave, onCancel }: HostFormProps) {
             Auto-connect
           </Text>
           <Text style={[styles.helperText, { color: colors.textMuted, marginBottom: 0 }]}>
-            Reconnect automatically on page reload (web)
+            Reconnect automatically when bridge connects
           </Text>
         </View>
         <Switch
@@ -340,43 +362,116 @@ function HostForm({ host, onSave, onCancel }: HostFormProps) {
 export default function SettingsScreen() {
   const colors = useThemeColors();
   const { themeMode, setThemeMode } = useTheme();
+  const { connectionState } = useConnectionState();
+  const {
+    configuredHosts,
+    configuredHostsLoading,
+    createHost,
+    updateHost,
+    deleteHost,
+    sendMessage,
+  } = useBridge();
   const {
     bridgeUrl,
     setBridgeUrl,
     bridgeAutoConnect,
     setBridgeAutoConnect,
-    hosts,
-    addHost,
-    updateHost,
-    removeHost,
     fontSize,
     setFontSize,
   } = useSettingsStore();
 
-  const [editingHost, setEditingHost] = useState<SSHHost | null>(null);
+  const [editingHost, setEditingHost] = useState<SSHHostConfig | null>(null);
   const [isAddingHost, setIsAddingHost] = useState(false);
   const [editingBridgeUrl, setEditingBridgeUrl] = useState(false);
   const [tempBridgeUrl, setTempBridgeUrl] = useState(bridgeUrl);
 
-  const handleSaveHost = useCallback(async (hostData: Omit<SSHHost, 'id'>, credential: string) => {
-    try {
-      if (editingHost) {
-        // Update existing host
-        updateHost(editingHost.id, hostData);
-        if (credential) {
-          await storeHostCredential(editingHost.id, credential);
-        }
-      } else {
-        // Add new host
-        const id = addHost(hostData);
-        await storeHostCredential(id, credential);
+  // Snippets state
+  const [showSnippetsModal, setShowSnippetsModal] = useState(false);
+  const [snippetsLoading, setSnippetsLoading] = useState(false);
+  const [snippets, setSnippets] = useState<Snippet[]>([]);
+
+  const isConnected = connectionState === 'connected';
+
+  // Handle snippet messages
+  useMessageHandler<SnippetListResultPayload>(
+    MessageTypes.SNIPPET_LIST_RESULT,
+    useCallback((msg: Message<SnippetListResultPayload>) => {
+      setSnippetsLoading(false);
+      setSnippets(msg.payload.snippets || []);
+    }, []),
+    []
+  );
+
+  useMessageHandler<SnippetCreateResultPayload>(
+    MessageTypes.SNIPPET_CREATE_RESULT,
+    useCallback((msg: Message<SnippetCreateResultPayload>) => {
+      if (msg.payload.success && msg.payload.snippet) {
+        setSnippets(prev => [...prev, msg.payload.snippet!].sort((a, b) => a.name.localeCompare(b.name)));
+      } else if (msg.payload.error) {
+        Alert.alert('Error', msg.payload.error);
       }
-      setEditingHost(null);
-      setIsAddingHost(false);
-    } catch (error) {
-      Alert.alert('Error', 'Failed to save host');
+    }, []),
+    []
+  );
+
+  useMessageHandler<SnippetUpdateResultPayload>(
+    MessageTypes.SNIPPET_UPDATE_RESULT,
+    useCallback((msg: Message<SnippetUpdateResultPayload>) => {
+      if (msg.payload.success && msg.payload.snippet) {
+        setSnippets(prev =>
+          prev.map(s => s.id === msg.payload.snippet!.id ? msg.payload.snippet! : s)
+            .sort((a, b) => a.name.localeCompare(b.name))
+        );
+      } else if (msg.payload.error) {
+        Alert.alert('Error', msg.payload.error);
+      }
+    }, []),
+    []
+  );
+
+  useMessageHandler<SnippetDeleteResultPayload>(
+    MessageTypes.SNIPPET_DELETE_RESULT,
+    useCallback((msg: Message<SnippetDeleteResultPayload>) => {
+      if (msg.payload.success && msg.payload.id) {
+        setSnippets(prev => prev.filter(s => s.id !== msg.payload.id));
+      } else if (msg.payload.error) {
+        Alert.alert('Error', msg.payload.error);
+      }
+    }, []),
+    []
+  );
+
+  const handleSaveHost = useCallback((data: HostFormData, credential: string) => {
+    if (editingHost) {
+      // Update existing host
+      updateHost(editingHost.id, {
+        name: data.name,
+        host: data.host,
+        port: data.port,
+        username: data.username,
+        authType: data.authType,
+        autoConnect: data.autoConnect,
+        credential: credential || undefined, // only send if provided
+      });
+    } else {
+      // Create new host
+      createHost({
+        name: data.name,
+        host: data.host,
+        port: data.port,
+        username: data.username,
+        authType: data.authType,
+        credential,
+        autoConnect: data.autoConnect,
+      });
     }
-  }, [editingHost, addHost, updateHost]);
+    setEditingHost(null);
+    setIsAddingHost(false);
+  }, [editingHost, createHost, updateHost]);
+
+  const handleDeleteHost = useCallback((id: string) => {
+    deleteHost(id);
+  }, [deleteHost]);
 
   const handleSaveBridgeUrl = () => {
     if (tempBridgeUrl.trim()) {
@@ -393,6 +488,30 @@ export default function SettingsScreen() {
     const nextIndex = (currentIndex + 1) % modes.length;
     setThemeMode(modes[nextIndex]);
   };
+
+  // Snippet handlers
+  const handleOpenSnippets = useCallback(() => {
+    setSnippetsLoading(true);
+    setSnippets([]);
+    setShowSnippetsModal(true);
+    sendMessage(Messages.snippetList());
+  }, [sendMessage]);
+
+  const handleCloseSnippets = useCallback(() => {
+    setShowSnippetsModal(false);
+  }, []);
+
+  const handleCreateSnippet = useCallback((name: string, content: string) => {
+    sendMessage(Messages.snippetCreate({ name, content }));
+  }, [sendMessage]);
+
+  const handleUpdateSnippet = useCallback((id: string, name: string, content: string) => {
+    sendMessage(Messages.snippetUpdate({ id, name, content }));
+  }, [sendMessage]);
+
+  const handleDeleteSnippet = useCallback((id: string) => {
+    sendMessage(Messages.snippetDelete({ id }));
+  }, [sendMessage]);
 
   // Show host form if adding or editing
   if (isAddingHost || editingHost) {
@@ -465,18 +584,52 @@ export default function SettingsScreen() {
         {/* SSH Hosts Section */}
         <SectionHeader title="SSH HOSTS" />
         <View style={[styles.section, { backgroundColor: colors.card }]}>
-          {hosts.map((host) => (
-            <HostRow
-              key={host.id}
-              host={host}
-              onEdit={() => setEditingHost(host)}
-              onDelete={() => removeHost(host.id)}
+          {!isConnected ? (
+            <View style={[styles.row, { borderBottomColor: colors.border }]}>
+              <Text style={[styles.rowLabel, { color: colors.textMuted }]}>
+                Connect to bridge to manage hosts
+              </Text>
+            </View>
+          ) : configuredHostsLoading ? (
+            <View style={[styles.row, { borderBottomColor: colors.border }]}>
+              <Text style={[styles.rowLabel, { color: colors.textMuted }]}>
+                Loading hosts...
+              </Text>
+            </View>
+          ) : (
+            <>
+              {configuredHosts.map((host) => (
+                <HostRow
+                  key={host.id}
+                  host={host}
+                  onEdit={() => setEditingHost(host)}
+                  onDelete={() => handleDeleteHost(host.id)}
+                />
+              ))}
+              <SettingsRow
+                label="+ Add Host"
+                onPress={() => setIsAddingHost(true)}
+              />
+            </>
+          )}
+        </View>
+
+        {/* Snippets Section */}
+        <SectionHeader title="COMMAND SNIPPETS" />
+        <View style={[styles.section, { backgroundColor: colors.card }]}>
+          {!isConnected ? (
+            <View style={[styles.row, { borderBottomColor: colors.border }]}>
+              <Text style={[styles.rowLabel, { color: colors.textMuted }]}>
+                Connect to bridge to manage snippets
+              </Text>
+            </View>
+          ) : (
+            <SettingsRow
+              label="Manage Snippets"
+              value={`${snippets.length} saved`}
+              onPress={handleOpenSnippets}
             />
-          ))}
-          <SettingsRow
-            label="+ Add Host"
-            onPress={() => setIsAddingHost(true)}
-          />
+          )}
         </View>
 
         {/* Appearance Section */}
@@ -495,7 +648,7 @@ export default function SettingsScreen() {
                   style={[styles.fontSizeButton, { backgroundColor: colors.backgroundSecondary }]}
                   onPress={() => setFontSize(fontSize - 1)}
                 >
-                  <Text style={{ fontSize: 18, color: colors.text }}>−</Text>
+                  <Text style={{ fontSize: 18, color: colors.text }}>-</Text>
                 </TouchableOpacity>
                 <Text style={[styles.fontSizeValue, { color: colors.text }]}>{fontSize}</Text>
                 <TouchableOpacity
@@ -518,6 +671,18 @@ export default function SettingsScreen() {
 
         <View style={styles.bottomPadding} />
       </ScrollView>
+
+      {/* Snippets Modal */}
+      <SnippetsModal
+        visible={showSnippetsModal}
+        mode="edit"
+        snippets={snippets}
+        loading={snippetsLoading}
+        onClose={handleCloseSnippets}
+        onCreateSnippet={handleCreateSnippet}
+        onUpdateSnippet={handleUpdateSnippet}
+        onDeleteSnippet={handleDeleteSnippet}
+      />
     </SafeAreaView>
   );
 }

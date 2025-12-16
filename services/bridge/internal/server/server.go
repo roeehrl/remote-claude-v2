@@ -11,6 +11,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/roeeharel/remote-claude-v2/services/bridge/internal/agentapi"
+	"github.com/roeeharel/remote-claude-v2/services/bridge/internal/crypto"
+	"github.com/roeeharel/remote-claude-v2/services/bridge/internal/env"
 	"github.com/roeeharel/remote-claude-v2/services/bridge/internal/process"
 	"github.com/roeeharel/remote-claude-v2/services/bridge/internal/protocol"
 	"github.com/roeeharel/remote-claude-v2/services/bridge/internal/pty"
@@ -31,6 +33,7 @@ type Server struct {
 	processRegistry *process.Registry
 	portScanner     *scanner.Scanner
 	storage         *storage.Store
+	envManager      *env.Manager
 	handlers        map[string]MessageHandler
 }
 
@@ -67,6 +70,7 @@ func New(addr string, dataDir string) (*Server, error) {
 		processRegistry: process.NewRegistry(),
 		portScanner:     scanner.NewScanner(),
 		storage:         store,
+		envManager:      env.NewManager(),
 		handlers:        make(map[string]MessageHandler),
 	}
 
@@ -87,8 +91,11 @@ func (s *Server) Stop() {
 		}
 	}
 
-	s.processRegistry.Close()
-	s.sshManager.Close()
+	// Detach from all processes (don't kill them - they survive bridge restarts)
+	// We intentionally do NOT close SSH connections here - just detach from tmux.
+	// This ensures tmux sessions keep running on remote hosts.
+	// The OS will clean up connections when the process exits.
+	s.processRegistry.DetachAll()
 	s.sessionManager.Stop()
 
 	log.Printf("[INFO] [SERVER] Shutdown complete")
@@ -97,6 +104,12 @@ func (s *Server) Stop() {
 // registerHandlers sets up message type handlers
 func (s *Server) registerHandlers() {
 	s.handlers[protocol.TypeAuth] = s.handleAuth
+	// Host Config (CRUD)
+	s.handlers[protocol.TypeHostConfigList] = s.handleHostConfigList
+	s.handlers[protocol.TypeHostConfigCreate] = s.handleHostConfigCreate
+	s.handlers[protocol.TypeHostConfigUpdate] = s.handleHostConfigUpdate
+	s.handlers[protocol.TypeHostConfigDelete] = s.handleHostConfigDelete
+	// Host Connection (runtime)
 	s.handlers[protocol.TypeHostConnect] = s.handleHostConnect
 	s.handlers[protocol.TypeHostDisconnect] = s.handleHostDisconnect
 	s.handlers[protocol.TypeHostCheckRequirements] = s.handleHostCheckRequirements
@@ -105,6 +118,7 @@ func (s *Server) registerHandlers() {
 	s.handlers[protocol.TypeProcessKill] = s.handleProcessKill
 	s.handlers[protocol.TypeProcessSelect] = s.handleProcessSelect
 	s.handlers[protocol.TypeProcessReattach] = s.handleProcessReattach
+	s.handlers[protocol.TypeProcessRename] = s.handleProcessRename
 	s.handlers[protocol.TypeClaudeStart] = s.handleClaudeStart
 	s.handlers[protocol.TypeClaudeKill] = s.handleClaudeKill
 	s.handlers[protocol.TypePtyInput] = s.handlePtyInput
@@ -116,6 +130,18 @@ func (s *Server) registerHandlers() {
 	s.handlers[protocol.TypeChatRaw] = s.handleChatRaw
 	s.handlers[protocol.TypeChatStatus] = s.handleChatStatus
 	s.handlers[protocol.TypeChatHistory] = s.handleChatHistory
+	// Environment Variables
+	s.handlers[protocol.TypeEnvList] = s.handleEnvList
+	s.handlers[protocol.TypeEnvUpdate] = s.handleEnvUpdate
+	s.handlers[protocol.TypeEnvSetRcFile] = s.handleEnvSetRcFile
+	s.handlers[protocol.TypeProcessEnvList] = s.handleProcessEnvList
+	// Ports Scanning
+	s.handlers[protocol.TypePortsScan] = s.handlePortsScan
+	// Snippets
+	s.handlers[protocol.TypeSnippetList] = s.handleSnippetList
+	s.handlers[protocol.TypeSnippetCreate] = s.handleSnippetCreate
+	s.handlers[protocol.TypeSnippetUpdate] = s.handleSnippetUpdate
+	s.handlers[protocol.TypeSnippetDelete] = s.handleSnippetDelete
 }
 
 // Start starts the HTTP server with WebSocket endpoint
@@ -307,18 +333,121 @@ func (s *Server) handleAuth(connSession *ConnectedSession, msg *protocol.Message
 }
 
 // sendCurrentHostStates sends HOST_STATUS for all connected SSH hosts
+// It also reattaches any detached PTY sessions to the new WebSocket session
 func (s *Server) sendCurrentHostStates(session *ConnectedSession) {
 	connectedHosts := s.sshManager.GetAllConnections()
 	for _, hostID := range connectedHosts {
+		// Get SSH connection for reattachment
+		sshConn := s.sshManager.GetConnection(hostID)
+		if sshConn == nil {
+			log.Printf("[WARN] [AUTH] No SSH connection found for host %s", hostID)
+			continue
+		}
+
+		// Check if SSH connection is actually alive
+		if !sshConn.IsAlive() {
+			log.Printf("[WARN] [AUTH] SSH connection for host %s is dead, skipping", hostID)
+			// Clean up dead connection and its processes
+			procs := s.processRegistry.GetByHost(hostID)
+			for _, proc := range procs {
+				s.processRegistry.Unregister(proc.ID)
+			}
+			s.sshManager.Disconnect(hostID)
+			continue
+		}
+
 		// Get processes for this host from process registry
 		processes := s.processRegistry.GetByHost(hostID)
 		processInfos := make([]protocol.ProcessInfo, 0, len(processes))
+		var staleProcesses []protocol.StaleProcess
+
 		for _, proc := range processes {
+			if proc.PTY == nil {
+				continue
+			}
+
+			// Check if PTY is attached - if not, try to reattach
+			if !proc.PTY.IsAttached() {
+				log.Printf("[DEBUG] [AUTH] Process %s PTY not attached, attempting reattach", proc.ID)
+				if err := s.reattachProcess(session, proc, sshConn.Client); err != nil {
+					log.Printf("[WARN] [AUTH] Failed to reattach process %s: %v", proc.ID, err)
+					// Report as stale/detached process
+					tmuxName := proc.PTY.TmuxName
+					startedAt := proc.StartedAt.Format("2006-01-02T15:04:05Z07:00")
+					stale := protocol.StaleProcess{
+						Reason:      "detached",
+						TmuxSession: &tmuxName,
+						ProcessID:   &proc.ID,
+						StartedAt:   &startedAt,
+					}
+					// Include port if this was a Claude process
+					if proc.Port != nil {
+						stale.Port = *proc.Port
+					}
+					staleProcesses = append(staleProcesses, stale)
+					// Unregister from registry since it needs manual reattach
+					s.processRegistry.Unregister(proc.ID)
+					continue
+				}
+				log.Printf("[INFO] [AUTH] Successfully reattached process %s", proc.ID)
+			} else {
+				// PTY is attached but output handler may be pointing to old session
+				// Update output handler to point to the new session
+				log.Printf("[DEBUG] [AUTH] Process %s already attached, updating output handler", proc.ID)
+				s.updatePtyOutputHandler(session, proc)
+			}
+
+			// If this is a Claude process, restore/update AgentAPI clients
+			if proc.Type == process.TypeClaude && proc.Port != nil {
+				port := *proc.Port
+				if proc.SSEClient != nil {
+					// SSE client exists, just update the handler
+					log.Printf("[DEBUG] [AUTH] Updating SSE handler for Claude process %s", proc.ID)
+					proc.SSEClient.SetHandler(func(event agentapi.SSEEvent) {
+						s.handleAgentAPIEvent(session, proc.HostID, proc.ID, event)
+					})
+				} else {
+					// SSE client doesn't exist, need to restore AgentAPI clients
+					log.Printf("[DEBUG] [AUTH] Restoring AgentAPI clients for Claude process %s on port %d", proc.ID, port)
+
+					// Create new AgentAPI client
+					agentClient := agentapi.NewClient(sshConn.Client, port)
+
+					// Create new SSE client with event handler pointing to new session
+					sseClient := agentapi.NewSSEClient(sshConn.Client, port, func(event agentapi.SSEEvent) {
+						s.handleAgentAPIEvent(session, proc.HostID, proc.ID, event)
+					})
+
+					// Store new clients
+					proc.SetAgentClients(agentClient, sseClient)
+
+					// Start SSE connection
+					if err := sseClient.Connect(); err != nil {
+						log.Printf("[WARN] [AUTH] SSE reconnection failed for process %s: %v", proc.ID, err)
+					}
+
+					// Check if AgentAPI is still responding
+					status, err := agentClient.GetStatus()
+					if err != nil {
+						log.Printf("[WARN] [AUTH] AgentAPI not responding for process %s: %v", proc.ID, err)
+						proc.SetAgentAPIReady(false)
+					} else {
+						log.Printf("[INFO] [AUTH] AgentAPI reconnected for process %s: status=%s", proc.ID, status.Status)
+						proc.SetAgentAPIReady(true)
+					}
+				}
+			}
+
+			// Refresh CWD from tmux before sending
+			proc.RefreshCWD()
+
+			// Process is attached (or was just reattached), report it
 			processInfos = append(processInfos, protocol.ProcessInfo{
 				ID:            proc.ID,
 				Type:          protocol.ProcessType(proc.Type),
 				HostID:        proc.HostID,
 				CWD:           proc.CWD,
+				Name:          proc.Name,
 				Port:          proc.Port,
 				PtyReady:      proc.PtyReady,
 				AgentAPIReady: proc.AgentAPIReady,
@@ -328,10 +457,23 @@ func (s *Server) sendCurrentHostStates(session *ConnectedSession) {
 			})
 		}
 
+		// Store stale processes in registry for later updates
+		s.processRegistry.SetStaleProcesses(hostID, staleProcesses)
+
+		// Check requirements (claude and agentapi installation)
+		requirements := pty.CheckRequirements(sshConn.Client)
+
+		var stalePtr *[]protocol.StaleProcess
+		if len(staleProcesses) > 0 {
+			stalePtr = &staleProcesses
+		}
+
 		msg, err := protocol.NewMessage(protocol.TypeHostStatus, protocol.HostStatusPayload{
-			HostID:    hostID,
-			Connected: true,
-			Processes: processInfos,
+			HostID:         hostID,
+			Connected:      true,
+			Processes:      processInfos,
+			StaleProcesses: stalePtr,
+			Requirements:   requirements,
 		})
 		if err != nil {
 			log.Printf("[ERROR] [AUTH] Failed to create host status message: %v", err)
@@ -341,10 +483,288 @@ func (s *Server) sendCurrentHostStates(session *ConnectedSession) {
 		if err := session.Send(msg); err != nil {
 			log.Printf("[ERROR] [AUTH] Failed to send host status: %v", err)
 		} else {
-			log.Printf("[DEBUG] [AUTH] Sent HOST_STATUS for %s with %d processes", hostID, len(processInfos))
+			log.Printf("[DEBUG] [AUTH] Sent HOST_STATUS for %s with %d processes, %d stale", hostID, len(processInfos), len(staleProcesses))
 		}
 	}
 }
+
+// sendHostStatus sends a HOST_STATUS message with current processes and stale processes for a host
+func (s *Server) sendHostStatus(connSession *ConnectedSession, hostID string) error {
+	// Get all active processes for this host
+	processes := s.processRegistry.GetByHost(hostID)
+	processInfos := make([]protocol.ProcessInfo, 0, len(processes))
+
+	for _, proc := range processes {
+		// Refresh CWD from tmux before sending
+		proc.RefreshCWD()
+		processInfos = append(processInfos, proc.ToInfo())
+	}
+
+	// Get stale processes from registry
+	staleProcesses := s.processRegistry.GetStaleProcesses(hostID)
+
+	var stalePtr *[]protocol.StaleProcess
+	if len(staleProcesses) > 0 {
+		stalePtr = &staleProcesses
+	}
+
+	// Check requirements if we have an SSH connection
+	var requirements *protocol.HostRequirements
+	if sshConn := s.sshManager.GetConnection(hostID); sshConn != nil {
+		requirements = pty.CheckRequirements(sshConn.Client)
+	}
+
+	msg, err := protocol.NewMessage(protocol.TypeHostStatus, protocol.HostStatusPayload{
+		HostID:         hostID,
+		Connected:      true,
+		Processes:      processInfos,
+		StaleProcesses: stalePtr,
+		Requirements:   requirements,
+	})
+	if err != nil {
+		return err
+	}
+
+	log.Printf("[DEBUG] [HOST] Sent HOST_STATUS for %s with %d processes, %d stale", hostID, len(processInfos), len(staleProcesses))
+	return connSession.Send(msg)
+}
+
+// ============================================================================
+// Host Configuration Handlers (CRUD)
+// ============================================================================
+
+func (s *Server) handleHostConfigList(connSession *ConnectedSession, msg *protocol.Message) error {
+	hosts, err := s.storage.ListSSHHosts()
+	if err != nil {
+		log.Printf("[ERROR] [HOST_CONFIG] Failed to list hosts: %v", err)
+		return s.sendHostConfigListResult(connSession, nil, err)
+	}
+
+	// Convert to protocol format (without credentials)
+	configHosts := make([]protocol.SSHHostConfig, len(hosts))
+	for i, h := range hosts {
+		configHosts[i] = protocol.SSHHostConfig{
+			ID:          h.ID,
+			Name:        h.Name,
+			Host:        h.Host,
+			Port:        h.Port,
+			Username:    h.Username,
+			AuthType:    h.AuthType,
+			AutoConnect: h.AutoConnect,
+			CreatedAt:   h.CreatedAt.Format(time.RFC3339),
+			UpdatedAt:   h.UpdatedAt.Format(time.RFC3339),
+		}
+	}
+
+	return s.sendHostConfigListResult(connSession, configHosts, nil)
+}
+
+func (s *Server) sendHostConfigListResult(connSession *ConnectedSession, hosts []protocol.SSHHostConfig, err error) error {
+	if hosts == nil {
+		hosts = []protocol.SSHHostConfig{}
+	}
+	msg, _ := protocol.NewMessage(protocol.TypeHostConfigListResult, protocol.HostConfigListResultPayload{
+		Hosts: hosts,
+	})
+	return connSession.Send(msg)
+}
+
+func (s *Server) handleHostConfigCreate(connSession *ConnectedSession, msg *protocol.Message) error {
+	var payload protocol.HostConfigCreatePayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return s.sendHostConfigCreateResult(connSession, nil, fmt.Errorf("invalid payload: %w", err))
+	}
+
+	// Validate required fields
+	if payload.Name == "" || payload.Host == "" || payload.Username == "" || payload.Credential == "" {
+		return s.sendHostConfigCreateResult(connSession, nil, fmt.Errorf("missing required fields"))
+	}
+
+	// Encrypt credential
+	encryptedCred, err := crypto.EncryptString(payload.Credential)
+	if err != nil {
+		log.Printf("[ERROR] [HOST_CONFIG] Failed to encrypt credential: %v", err)
+		return s.sendHostConfigCreateResult(connSession, nil, fmt.Errorf("failed to encrypt credential"))
+	}
+
+	// Generate ID
+	hostID := fmt.Sprintf("host_%d_%s", time.Now().UnixMilli(), uuid.New().String()[:8])
+
+	autoConnect := false
+	if payload.AutoConnect != nil {
+		autoConnect = *payload.AutoConnect
+	}
+
+	// Create host record
+	host := storage.SSHHost{
+		ID:                  hostID,
+		Name:                payload.Name,
+		Host:                payload.Host,
+		Port:                payload.Port,
+		Username:            payload.Username,
+		AuthType:            payload.AuthType,
+		CredentialEncrypted: encryptedCred,
+		AutoConnect:         autoConnect,
+	}
+
+	if err := s.storage.CreateSSHHost(host); err != nil {
+		log.Printf("[ERROR] [HOST_CONFIG] Failed to create host: %v", err)
+		return s.sendHostConfigCreateResult(connSession, nil, fmt.Errorf("failed to create host"))
+	}
+
+	// Return created host (without credential)
+	configHost := &protocol.SSHHostConfig{
+		ID:          host.ID,
+		Name:        host.Name,
+		Host:        host.Host,
+		Port:        host.Port,
+		Username:    host.Username,
+		AuthType:    host.AuthType,
+		AutoConnect: host.AutoConnect,
+		CreatedAt:   time.Now().Format(time.RFC3339),
+		UpdatedAt:   time.Now().Format(time.RFC3339),
+	}
+
+	log.Printf("[INFO] [HOST_CONFIG] Created host: %s (%s)", host.ID, host.Name)
+	return s.sendHostConfigCreateResult(connSession, configHost, nil)
+}
+
+func (s *Server) sendHostConfigCreateResult(connSession *ConnectedSession, host *protocol.SSHHostConfig, err error) error {
+	payload := protocol.HostConfigCreateResultPayload{
+		Success: err == nil,
+		Host:    host,
+	}
+	if err != nil {
+		errStr := err.Error()
+		payload.Error = &errStr
+	}
+	msg, _ := protocol.NewMessage(protocol.TypeHostConfigCreateResult, payload)
+	return connSession.Send(msg)
+}
+
+func (s *Server) handleHostConfigUpdate(connSession *ConnectedSession, msg *protocol.Message) error {
+	var payload protocol.HostConfigUpdatePayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return s.sendHostConfigUpdateResult(connSession, nil, fmt.Errorf("invalid payload: %w", err))
+	}
+
+	// Get existing host
+	existing, err := s.storage.GetSSHHost(payload.ID)
+	if err != nil {
+		log.Printf("[ERROR] [HOST_CONFIG] Failed to get host: %v", err)
+		return s.sendHostConfigUpdateResult(connSession, nil, fmt.Errorf("failed to get host"))
+	}
+	if existing == nil {
+		return s.sendHostConfigUpdateResult(connSession, nil, fmt.Errorf("host not found"))
+	}
+
+	// Apply updates
+	if payload.Name != nil {
+		existing.Name = *payload.Name
+	}
+	if payload.Host != nil {
+		existing.Host = *payload.Host
+	}
+	if payload.Port != nil {
+		existing.Port = *payload.Port
+	}
+	if payload.Username != nil {
+		existing.Username = *payload.Username
+	}
+	if payload.AuthType != nil {
+		existing.AuthType = *payload.AuthType
+	}
+	if payload.AutoConnect != nil {
+		existing.AutoConnect = *payload.AutoConnect
+	}
+	if payload.Credential != nil && *payload.Credential != "" {
+		encryptedCred, err := crypto.EncryptString(*payload.Credential)
+		if err != nil {
+			log.Printf("[ERROR] [HOST_CONFIG] Failed to encrypt credential: %v", err)
+			return s.sendHostConfigUpdateResult(connSession, nil, fmt.Errorf("failed to encrypt credential"))
+		}
+		existing.CredentialEncrypted = encryptedCred
+	}
+
+	// Save updates
+	if err := s.storage.UpdateSSHHost(*existing); err != nil {
+		log.Printf("[ERROR] [HOST_CONFIG] Failed to update host: %v", err)
+		return s.sendHostConfigUpdateResult(connSession, nil, fmt.Errorf("failed to update host"))
+	}
+
+	// Return updated host (without credential)
+	configHost := &protocol.SSHHostConfig{
+		ID:          existing.ID,
+		Name:        existing.Name,
+		Host:        existing.Host,
+		Port:        existing.Port,
+		Username:    existing.Username,
+		AuthType:    existing.AuthType,
+		AutoConnect: existing.AutoConnect,
+		CreatedAt:   existing.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:   time.Now().Format(time.RFC3339),
+	}
+
+	log.Printf("[INFO] [HOST_CONFIG] Updated host: %s (%s)", existing.ID, existing.Name)
+	return s.sendHostConfigUpdateResult(connSession, configHost, nil)
+}
+
+func (s *Server) sendHostConfigUpdateResult(connSession *ConnectedSession, host *protocol.SSHHostConfig, err error) error {
+	payload := protocol.HostConfigUpdateResultPayload{
+		Success: err == nil,
+		Host:    host,
+	}
+	if err != nil {
+		errStr := err.Error()
+		payload.Error = &errStr
+	}
+	msg, _ := protocol.NewMessage(protocol.TypeHostConfigUpdateResult, payload)
+	return connSession.Send(msg)
+}
+
+func (s *Server) handleHostConfigDelete(connSession *ConnectedSession, msg *protocol.Message) error {
+	var payload protocol.HostConfigDeletePayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return s.sendHostConfigDeleteResult(connSession, "", fmt.Errorf("invalid payload: %w", err))
+	}
+
+	// Check if host exists
+	existing, err := s.storage.GetSSHHost(payload.ID)
+	if err != nil {
+		log.Printf("[ERROR] [HOST_CONFIG] Failed to get host: %v", err)
+		return s.sendHostConfigDeleteResult(connSession, "", fmt.Errorf("failed to get host"))
+	}
+	if existing == nil {
+		return s.sendHostConfigDeleteResult(connSession, "", fmt.Errorf("host not found"))
+	}
+
+	// Delete the host
+	if err := s.storage.DeleteSSHHost(payload.ID); err != nil {
+		log.Printf("[ERROR] [HOST_CONFIG] Failed to delete host: %v", err)
+		return s.sendHostConfigDeleteResult(connSession, "", fmt.Errorf("failed to delete host"))
+	}
+
+	log.Printf("[INFO] [HOST_CONFIG] Deleted host: %s (%s)", payload.ID, existing.Name)
+	return s.sendHostConfigDeleteResult(connSession, payload.ID, nil)
+}
+
+func (s *Server) sendHostConfigDeleteResult(connSession *ConnectedSession, id string, err error) error {
+	payload := protocol.HostConfigDeleteResultPayload{
+		Success: err == nil,
+	}
+	if err == nil {
+		payload.ID = &id
+	} else {
+		errStr := err.Error()
+		payload.Error = &errStr
+	}
+	msg, _ := protocol.NewMessage(protocol.TypeHostConfigDeleteResult, payload)
+	return connSession.Send(msg)
+}
+
+// ============================================================================
+// Host Connection Handlers (runtime)
+// ============================================================================
 
 func (s *Server) handleHostConnect(connSession *ConnectedSession, msg *protocol.Message) error {
 	var payload protocol.HostConnectPayload
@@ -352,21 +772,56 @@ func (s *Server) handleHostConnect(connSession *ConnectedSession, msg *protocol.
 		return err
 	}
 
-	log.Printf("[DEBUG] [HOST] Connect request: host=%s port=%d user=%s", payload.Host, payload.Port, payload.Username)
+	// Get host config from storage
+	hostConfig, err := s.storage.GetSSHHost(payload.HostID)
+	if err != nil {
+		log.Printf("[ERROR] [HOST] Failed to get host config: %v", err)
+		response, _ := protocol.NewMessage(protocol.TypeHostStatus, protocol.HostStatusPayload{
+			HostID:    payload.HostID,
+			Connected: false,
+			Processes: []protocol.ProcessInfo{},
+			Error:     strPtr("Failed to get host configuration"),
+		})
+		return connSession.Send(response)
+	}
+	if hostConfig == nil {
+		log.Printf("[ERROR] [HOST] Host not found: %s", payload.HostID)
+		response, _ := protocol.NewMessage(protocol.TypeHostStatus, protocol.HostStatusPayload{
+			HostID:    payload.HostID,
+			Connected: false,
+			Processes: []protocol.ProcessInfo{},
+			Error:     strPtr("Host not found - please add it in settings first"),
+		})
+		return connSession.Send(response)
+	}
+
+	// Decrypt credential
+	credential, err := crypto.DecryptString(hostConfig.CredentialEncrypted)
+	if err != nil {
+		log.Printf("[ERROR] [HOST] Failed to decrypt credential: %v", err)
+		response, _ := protocol.NewMessage(protocol.TypeHostStatus, protocol.HostStatusPayload{
+			HostID:    payload.HostID,
+			Connected: false,
+			Processes: []protocol.ProcessInfo{},
+			Error:     strPtr("Failed to decrypt credentials"),
+		})
+		return connSession.Send(response)
+	}
+
+	log.Printf("[DEBUG] [HOST] Connect request: host=%s port=%d user=%s", hostConfig.Host, hostConfig.Port, hostConfig.Username)
 
 	// Build auth config
 	authConfig := ssh.AuthConfig{
-		AuthType: payload.AuthType,
+		AuthType: hostConfig.AuthType,
 	}
-	if payload.Password != nil {
-		authConfig.Password = *payload.Password
-	}
-	if payload.PrivateKey != nil {
-		authConfig.PrivateKey = *payload.PrivateKey
+	if hostConfig.AuthType == "password" {
+		authConfig.Password = credential
+	} else {
+		authConfig.PrivateKey = credential
 	}
 
 	// Establish SSH connection
-	conn, err := s.sshManager.Connect(payload.HostID, payload.Host, payload.Port, payload.Username, authConfig)
+	conn, err := s.sshManager.Connect(payload.HostID, hostConfig.Host, hostConfig.Port, hostConfig.Username, authConfig)
 	if err != nil {
 		log.Printf("[ERROR] [HOST] SSH connection failed: %v", err)
 		response, _ := protocol.NewMessage(protocol.TypeHostStatus, protocol.HostStatusPayload{
@@ -388,6 +843,31 @@ func (s *Server) handleHostConnect(connSession *ConnectedSession, msg *protocol.
 	// Also scan for existing AgentAPI servers (for Claude process detection)
 	scannedProcesses, staleAgentAPIs := s.portScanner.ScanPorts(conn.Client, payload.HostID)
 
+	// Mark occupied ports as in-use in the port pool to prevent reallocation
+	// This is critical for preventing port conflicts after reconnect
+	for _, scanned := range scannedProcesses {
+		if scanned.Port != nil {
+			s.processRegistry.MarkPortInUse(*scanned.Port)
+		}
+	}
+	for _, stale := range staleAgentAPIs {
+		if stale.Port > 0 {
+			s.processRegistry.MarkPortInUse(stale.Port)
+		}
+	}
+	// Also mark ports from detached tmux sessions (from stored metadata)
+	for _, detached := range detachedProcesses {
+		if detached.Port > 0 {
+			s.processRegistry.MarkPortInUse(detached.Port)
+		}
+	}
+	// Mark ports from reattached processes (still in registry)
+	for _, procInfo := range processInfos {
+		if procInfo.Port != nil {
+			s.processRegistry.MarkPortInUse(*procInfo.Port)
+		}
+	}
+
 	// Cross-reference: if we found an AgentAPI on a port, mark the corresponding process as Claude
 	for _, scanned := range scannedProcesses {
 		if scanned.Port == nil {
@@ -408,6 +888,9 @@ func (s *Server) handleHostConnect(connSession *ConnectedSession, msg *protocol.
 	var allStaleProcesses []protocol.StaleProcess
 	allStaleProcesses = append(allStaleProcesses, detachedProcesses...)
 	allStaleProcesses = append(allStaleProcesses, staleAgentAPIs...)
+
+	// Store stale processes in registry for later updates
+	s.processRegistry.SetStaleProcesses(payload.HostID, allStaleProcesses)
 
 	// Check requirements (claude and agentapi installation)
 	requirements := pty.CheckRequirements(conn.Client)
@@ -450,6 +933,9 @@ func (s *Server) handleHostDisconnect(connSession *ConnectedSession, msg *protoc
 		proc.Detach()
 		s.processRegistry.Unregister(proc.ID)
 	}
+
+	// Clear stale processes for this host
+	s.processRegistry.ClearStaleProcesses(payload.HostID)
 
 	// Close SSH connection
 	s.sshManager.Disconnect(payload.HostID)
@@ -515,6 +1001,8 @@ func (s *Server) handleProcessList(connSession *ConnectedSession, msg *protocol.
 	procs := s.processRegistry.GetByHost(payload.HostID)
 	var processInfos []protocol.ProcessInfo
 	for _, proc := range procs {
+		// Refresh CWD from tmux before sending
+		proc.RefreshCWD()
 		processInfos = append(processInfos, proc.ToInfo())
 	}
 
@@ -586,10 +1074,59 @@ func (s *Server) handleProcessCreate(connSession *ConnectedSession, msg *protoco
 	// Register process
 	s.processRegistry.Register(proc)
 
-	// Register process with storage for history tracking
+	// Register process with storage for history tracking and metadata persistence
 	if s.storage != nil {
 		s.storage.RegisterProcess(processID, payload.HostID)
+
+		// Save process metadata for recovery after bridge restart
+		shellPID := 0
+		if proc.ShellPID != nil {
+			shellPID = *proc.ShellPID
+		}
+		if err := s.storage.SaveProcessMetadata(storage.ProcessMetadata{
+			ProcessID:   processID,
+			HostID:      payload.HostID,
+			ProcessType: "shell",
+			TmuxName:    ptySession.TmuxName,
+			CWD:         proc.CWD,
+			ShellPID:    shellPID,
+			StartedAt:   proc.StartedAt,
+		}); err != nil {
+			log.Printf("[WARN] [PROCESS] Failed to save process metadata: %v", err)
+		}
 	}
+
+	// Capture environment variables at spawn time (before user interaction)
+	// This captures the shell's environment AFTER sourcing RC files
+	go func() {
+		// Small delay to ensure shell has fully initialized and sourced RC files
+		time.Sleep(200 * time.Millisecond)
+
+		envVars, err := s.envManager.CaptureProcessEnvAtSpawn(sshConn.Client, ptySession.TmuxName)
+		if err != nil {
+			log.Printf("[WARN] [PROCESS] Failed to capture env vars for process %s: %v", processID, err)
+			return
+		}
+
+		// Convert env.EnvVar to process.EnvVar and store in process
+		procEnvVars := make([]process.EnvVar, len(envVars))
+		for i, v := range envVars {
+			procEnvVars[i] = process.EnvVar{Key: v.Key, Value: v.Value}
+		}
+		proc.EnvVars = procEnvVars
+		log.Printf("[DEBUG] [PROCESS] Captured %d env vars for process %s", len(procEnvVars), processID)
+
+		// Persist env vars to storage for reconnect survival
+		if s.storage != nil {
+			storageEnvVars := make([]storage.EnvVar, len(envVars))
+			for i, v := range envVars {
+				storageEnvVars[i] = storage.EnvVar{Key: v.Key, Value: v.Value}
+			}
+			if err := s.storage.UpdateProcessEnvVars(processID, storageEnvVars); err != nil {
+				log.Printf("[WARN] [PROCESS] Failed to persist env vars for process %s: %v", processID, err)
+			}
+		}
+	}()
 
 	// Set up PTY output handler to forward to WebSocket
 	s.updatePtyOutputHandler(connSession, proc)
@@ -629,10 +1166,13 @@ func (s *Server) handleProcessKill(connSession *ConnectedSession, msg *protocol.
 		log.Printf("[WARN] [PROCESS] Error closing process %s: %v", payload.ProcessID, err)
 	}
 
-	// Clear history from storage
+	// Clear history and metadata from storage
 	if s.storage != nil {
 		if err := s.storage.UnregisterProcess(payload.ProcessID); err != nil {
 			log.Printf("[WARN] [PROCESS] Error clearing storage for process %s: %v", payload.ProcessID, err)
+		}
+		if err := s.storage.DeleteProcessMetadata(payload.ProcessID); err != nil {
+			log.Printf("[WARN] [PROCESS] Error deleting metadata for process %s: %v", payload.ProcessID, err)
 		}
 	}
 
@@ -644,6 +1184,49 @@ func (s *Server) handleProcessKill(connSession *ConnectedSession, msg *protocol.
 	// Send process killed notification
 	response, err := protocol.NewMessage(protocol.TypeProcessKilled, protocol.ProcessKilledPayload{
 		ProcessID: payload.ProcessID,
+	})
+	if err != nil {
+		return err
+	}
+
+	return connSession.Send(response)
+}
+
+func (s *Server) handleProcessRename(connSession *ConnectedSession, msg *protocol.Message) error {
+	var payload protocol.ProcessRenamePayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return err
+	}
+
+	log.Printf("[DEBUG] [PROCESS] Rename request: processId=%s name=%q", payload.ProcessID, payload.Name)
+
+	// Get the process
+	proc := s.processRegistry.Get(payload.ProcessID)
+	if proc == nil {
+		return connSession.SendError("NOT_FOUND", "Process not found")
+	}
+
+	// Update the name in memory
+	proc.SetName(payload.Name)
+
+	// Persist the name to database
+	if s.storage != nil {
+		if err := s.storage.UpdateProcessName(payload.ProcessID, payload.Name); err != nil {
+			log.Printf("[WARN] [PROCESS] Failed to persist process name: %v", err)
+		}
+	}
+
+	// Broadcast process updated to all sessions
+	info := proc.ToInfo()
+	response, err := protocol.NewMessage(protocol.TypeProcessUpdated, protocol.ProcessUpdatedPayload{
+		ID:            info.ID,
+		Type:          info.Type,
+		Port:          info.Port,
+		Name:          info.Name,
+		PtyReady:      info.PtyReady,
+		AgentAPIReady: info.AgentAPIReady,
+		ShellPID:      info.ShellPID,
+		AgentAPIPID:   info.AgentAPIPID,
 	})
 	if err != nil {
 		return err
@@ -688,14 +1271,56 @@ func (s *Server) handleProcessReattach(connSession *ConnectedSession, msg *proto
 		return connSession.SendError("ATTACH_FAILED", fmt.Sprintf("Failed to attach: %v", err))
 	}
 
-	// Create process record
+	// Get stale process info before removing (to get the port if it was a Claude process)
+	staleProc := s.processRegistry.GetStaleProcess(payload.HostID, payload.ProcessID)
+	var savedPort int
+	var savedName string
+	if staleProc != nil {
+		log.Printf("[DEBUG] [PROCESS] Found stale process %s with port=%d reason=%s", payload.ProcessID, staleProc.Port, staleProc.Reason)
+		if staleProc.Port > 0 {
+			savedPort = staleProc.Port
+		}
+	}
+
+	// Always check storage for metadata (name, port, env vars, etc.)
+	var savedEnvVars []process.EnvVar
+	if s.storage != nil {
+		if meta, err := s.storage.GetProcessMetadata(payload.ProcessID); err == nil && meta != nil {
+			log.Printf("[DEBUG] [PROCESS] Found metadata in storage: type=%s port=%d name=%q envVars=%d", meta.ProcessType, meta.Port, meta.Name, len(meta.EnvVars))
+			if meta.Port > 0 && savedPort == 0 {
+				savedPort = meta.Port
+			}
+			if meta.Name != "" {
+				savedName = meta.Name
+			}
+			// Load saved env vars
+			if len(meta.EnvVars) > 0 {
+				savedEnvVars = make([]process.EnvVar, len(meta.EnvVars))
+				for i, v := range meta.EnvVars {
+					savedEnvVars[i] = process.EnvVar{Key: v.Key, Value: v.Value}
+				}
+			}
+		} else if err != nil {
+			log.Printf("[WARN] [PROCESS] Error getting metadata from storage: %v", err)
+		} else {
+			log.Printf("[DEBUG] [PROCESS] No metadata found in storage for %s", payload.ProcessID)
+		}
+	}
+
+	// Create process record (default to shell, will restore Claude below if port exists)
 	proc := &process.Process{
 		ID:        payload.ProcessID,
-		Type:      process.TypeShell, // Default to shell
+		Type:      process.TypeShell,
 		HostID:    payload.HostID,
 		PTY:       ptySession,
 		StartedAt: time.Now(),
 		PtyReady:  true,
+		EnvVars:   savedEnvVars, // Restore saved env vars
+	}
+
+	// Restore saved name if available
+	if savedName != "" {
+		proc.SetName(savedName)
 	}
 
 	// Get and set the shell PID
@@ -708,23 +1333,28 @@ func (s *Server) handleProcessReattach(connSession *ConnectedSession, msg *proto
 	// Register process
 	s.processRegistry.Register(proc)
 
+	// Remove from stale processes
+	s.processRegistry.RemoveStaleProcess(payload.HostID, payload.ProcessID)
+
 	// Set up output handler
 	s.updatePtyOutputHandler(connSession, proc)
 
 	// Start output loop
 	ptySession.StartOutputLoop()
 
-	log.Printf("[INFO] [PROCESS] Reattached to process %s (tmux: %s)", payload.ProcessID, payload.TmuxSession)
-
-	// Send process created notification
-	response, err := protocol.NewMessage(protocol.TypeProcessCreated, protocol.ProcessCreatedPayload{
-		Process: proc.ToInfo(),
-	})
-	if err != nil {
-		return err
+	// Restore Claude state if we have a saved port
+	if savedPort > 0 {
+		log.Printf("[INFO] [PROCESS] Attempting to restore Claude state for process %s with port %d", payload.ProcessID, savedPort)
+		s.restoreClaude(connSession, proc, conn.Client, savedPort)
+		log.Printf("[INFO] [PROCESS] After restoreClaude: process %s type=%s", payload.ProcessID, proc.Type)
+	} else {
+		log.Printf("[DEBUG] [PROCESS] No saved port found, process %s will remain as shell", payload.ProcessID)
 	}
 
-	return connSession.Send(response)
+	log.Printf("[INFO] [PROCESS] Reattached to process %s (tmux: %s, type: %s)", payload.ProcessID, payload.TmuxSession, proc.Type)
+
+	// Send HOST_STATUS with updated processes and stale processes
+	return s.sendHostStatus(connSession, payload.HostID)
 }
 
 func (s *Server) handleProcessSelect(session *ConnectedSession, msg *protocol.Message) error {
@@ -745,7 +1375,11 @@ func (s *Server) handleClaudeStart(connSession *ConnectedSession, msg *protocol.
 		return err
 	}
 
-	log.Printf("[DEBUG] [CLAUDE] Start request: processId=%s", payload.ProcessID)
+	claudeArgsStr := "<nil>"
+	if payload.ClaudeArgs != nil {
+		claudeArgsStr = *payload.ClaudeArgs
+	}
+	log.Printf("[DEBUG] [CLAUDE] Start request: processId=%s, claudeArgs=%q", payload.ProcessID, claudeArgsStr)
 
 	// Get the process
 	proc := s.processRegistry.Get(payload.ProcessID)
@@ -778,9 +1412,14 @@ func (s *Server) handleClaudeStart(connSession *ConnectedSession, msg *protocol.
 	log.Printf("[DEBUG] [CLAUDE] Allocated port %d for process %s", port, payload.ProcessID)
 
 	// Start AgentAPI server in background
-	// Command: agentapi server --type=claude --port {port} -- claude &
+	// Command: agentapi server --type=claude --port {port} -- claude [claudeArgs] &
 	// --type=claude is required for proper message formatting
-	startCmd := fmt.Sprintf("agentapi server --type=claude --port %d -- claude &\n", port)
+	claudeCmd := "claude"
+	if payload.ClaudeArgs != nil && *payload.ClaudeArgs != "" {
+		claudeCmd = fmt.Sprintf("claude %s", *payload.ClaudeArgs)
+	}
+	startCmd := fmt.Sprintf("agentapi server --type=claude --port %d -- %s &\n", port, claudeCmd)
+	log.Printf("[DEBUG] [CLAUDE] Executing command: %s", startCmd)
 	if err := proc.PTY.Write([]byte(startCmd)); err != nil {
 		s.processRegistry.ReleasePort(port)
 		return connSession.SendError("PTY_ERROR", "Failed to start AgentAPI: "+err.Error())
@@ -829,15 +1468,34 @@ func (s *Server) handleClaudeStart(connSession *ConnectedSession, msg *protocol.
 		proc.SetAgentAPIReady(true)
 	}
 
+	// Detect AgentAPI server PID
+	if agentAPIPID, err := s.detectAgentAPIPID(sshConn.Client, port); err == nil {
+		proc.SetAgentAPIPID(agentAPIPID)
+		log.Printf("[INFO] [CLAUDE] Detected AgentAPI PID: %d", agentAPIPID)
+	} else {
+		log.Printf("[WARN] [CLAUDE] Could not detect AgentAPI PID: %v", err)
+	}
+
 	log.Printf("[INFO] [CLAUDE] Started Claude on process %s (port %d)", payload.ProcessID, port)
 
-	// Send process_updated notification
+	// Persist process type and port to database
+	if s.storage != nil {
+		if err := s.storage.UpdateProcessType(payload.ProcessID, "claude", port); err != nil {
+			log.Printf("[WARN] [CLAUDE] Failed to persist process type for %s: %v", payload.ProcessID, err)
+		}
+	}
+
+	// Send process_updated notification with all fields including PIDs
+	info := proc.ToInfo()
 	response, err := protocol.NewMessage(protocol.TypeProcessUpdated, protocol.ProcessUpdatedPayload{
-		ID:            proc.ID,
-		Type:          protocol.ProcessTypeClaude,
-		Port:          &port,
-		PtyReady:      proc.PtyReady,
-		AgentAPIReady: proc.AgentAPIReady,
+		ID:            info.ID,
+		Type:          info.Type,
+		Port:          info.Port,
+		Name:          info.Name,
+		PtyReady:      info.PtyReady,
+		AgentAPIReady: info.AgentAPIReady,
+		ShellPID:      info.ShellPID,
+		AgentAPIPID:   info.AgentAPIPID,
 	})
 	if err != nil {
 		return err
@@ -1480,6 +2138,42 @@ func (s *Server) reattachProcess(connSession *ConnectedSession, proc *process.Pr
 	// Restart output loop
 	proc.PTY.StartOutputLoop()
 
+	// If this is a Claude process with a port, restore AgentAPI clients
+	if proc.Type == process.TypeClaude && proc.Port != nil {
+		port := *proc.Port
+		log.Printf("[DEBUG] [PTY] Restoring AgentAPI clients for Claude process %s on port %d", proc.ID, port)
+
+		// Clear old clients first
+		proc.ClearAgentClients()
+
+		// Create new AgentAPI client
+		agentClient := agentapi.NewClient(sshClient, port)
+
+		// Create new SSE client with event handler pointing to new session
+		sseClient := agentapi.NewSSEClient(sshClient, port, func(event agentapi.SSEEvent) {
+			s.handleAgentAPIEvent(connSession, proc.HostID, proc.ID, event)
+		})
+
+		// Store new clients
+		proc.SetAgentClients(agentClient, sseClient)
+
+		// Start SSE connection
+		if err := sseClient.Connect(); err != nil {
+			log.Printf("[WARN] [PTY] SSE reconnection failed for process %s: %v", proc.ID, err)
+			// Don't fail - process is still reattached, just no SSE
+		}
+
+		// Check if AgentAPI is still responding
+		status, err := agentClient.GetStatus()
+		if err != nil {
+			log.Printf("[WARN] [PTY] AgentAPI not responding for process %s: %v", proc.ID, err)
+			proc.SetAgentAPIReady(false)
+		} else {
+			log.Printf("[INFO] [PTY] AgentAPI reconnected for process %s: status=%s", proc.ID, status.Status)
+			proc.SetAgentAPIReady(true)
+		}
+	}
+
 	log.Printf("[INFO] [PTY] Reattached process %s to session %s", proc.ID, connSession.ID)
 	return nil
 }
@@ -1515,13 +2209,676 @@ func (s *Server) scanAndRegisterTmuxSessions(connSession *ConnectedSession, host
 		// Orphaned tmux session - report as detached for manual reattach
 		log.Printf("[INFO] [TMUX] Found detached tmux session %s", tmuxInfo.Name)
 		startedAt := tmuxInfo.Created.Format("2006-01-02T15:04:05Z07:00")
-		detachedProcesses = append(detachedProcesses, protocol.StaleProcess{
+
+		stale := protocol.StaleProcess{
 			Reason:      "detached",
 			TmuxSession: &tmuxInfo.Name,
 			ProcessID:   &tmuxInfo.ProcessID,
 			StartedAt:   &startedAt,
-		})
+		}
+
+		// Look up stored metadata to get port if this was a Claude process
+		if s.storage != nil {
+			meta, err := s.storage.GetProcessMetadata(tmuxInfo.ProcessID)
+			if err != nil {
+				log.Printf("[WARN] [TMUX] Error getting metadata for process %s: %v", tmuxInfo.ProcessID, err)
+			} else if meta == nil {
+				log.Printf("[DEBUG] [TMUX] No stored metadata found for process %s", tmuxInfo.ProcessID)
+			} else {
+				log.Printf("[DEBUG] [TMUX] Found stored metadata for process %s: type=%s port=%d", tmuxInfo.ProcessID, meta.ProcessType, meta.Port)
+				if meta.Port > 0 {
+					stale.Port = meta.Port
+				}
+			}
+		} else {
+			log.Printf("[WARN] [TMUX] Storage is nil, cannot look up process metadata")
+		}
+
+		detachedProcesses = append(detachedProcesses, stale)
 	}
 
 	return processInfos, detachedProcesses
+}
+
+// restoreClaude restores Claude state for a reattached process using the saved port
+func (s *Server) restoreClaude(connSession *ConnectedSession, proc *process.Process, sshClient *cryptossh.Client, port int) {
+	log.Printf("[DEBUG] [CLAUDE] Restoring Claude state for process %s on port %d", proc.ID, port)
+
+	// Create AgentAPI client to check if the server is still responding
+	agentClient := agentapi.NewClient(sshClient, port)
+
+	// Check if AgentAPI is responding
+	status, err := agentClient.GetStatus()
+	if err != nil {
+		log.Printf("[WARN] [CLAUDE] AgentAPI on port %d not responding for process %s: %v", port, proc.ID, err)
+		log.Printf("[DEBUG] [CLAUDE] Process %s will remain as shell", proc.ID)
+		return
+	}
+
+	log.Printf("[INFO] [CLAUDE] AgentAPI responding on port %d for process %s: status=%s", port, proc.ID, status.Status)
+
+	// Update process type and port
+	proc.UpdateType(process.TypeClaude)
+	proc.SetPort(port)
+
+	// Create SSE client with event handler
+	sseClient := agentapi.NewSSEClient(sshClient, port, func(event agentapi.SSEEvent) {
+		s.handleAgentAPIEvent(connSession, proc.HostID, proc.ID, event)
+	})
+
+	// Store clients in process
+	proc.SetAgentClients(agentClient, sseClient)
+
+	// Start SSE connection
+	if err := sseClient.Connect(); err != nil {
+		log.Printf("[WARN] [CLAUDE] SSE connection failed for process %s: %v", proc.ID, err)
+	}
+
+	proc.SetAgentAPIReady(true)
+
+	// Detect AgentAPI server PID
+	if agentAPIPID, err := s.detectAgentAPIPID(sshClient, port); err == nil {
+		proc.SetAgentAPIPID(agentAPIPID)
+		log.Printf("[INFO] [CLAUDE] Detected AgentAPI PID: %d", agentAPIPID)
+	} else {
+		log.Printf("[WARN] [CLAUDE] Could not detect AgentAPI PID: %v", err)
+	}
+
+	log.Printf("[INFO] [CLAUDE] Successfully restored Claude state for process %s", proc.ID)
+}
+
+// detectAgentAPIPID finds the PID of the agentapi server process on the given port
+func (s *Server) detectAgentAPIPID(sshClient *cryptossh.Client, port int) (int, error) {
+	session, err := sshClient.NewSession()
+	if err != nil {
+		return 0, fmt.Errorf("failed to create SSH session: %w", err)
+	}
+	defer session.Close()
+
+	// Use lsof to find the process listening on the port
+	cmd := fmt.Sprintf("lsof -ti :%d 2>/dev/null | head -1", port)
+	output, err := session.Output(cmd)
+	if err != nil {
+		return 0, fmt.Errorf("lsof command failed: %w", err)
+	}
+
+	var pid int
+	if _, err := fmt.Sscanf(string(output), "%d", &pid); err != nil {
+		return 0, fmt.Errorf("failed to parse PID from output %q: %w", string(output), err)
+	}
+
+	return pid, nil
+}
+
+// ============================================================================
+// Environment Variable Handlers
+// ============================================================================
+
+// handleEnvList returns system and custom env vars for a host
+func (s *Server) handleEnvList(connSession *ConnectedSession, msg *protocol.Message) error {
+	var payload protocol.EnvListPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return err
+	}
+
+	log.Printf("[DEBUG] [ENV] List request for host %s", payload.HostID)
+
+	// Get SSH connection
+	sshConn := s.sshManager.GetConnection(payload.HostID)
+	if sshConn == nil {
+		return connSession.SendError("NOT_CONNECTED", "Host is not connected")
+	}
+
+	// Detect RC file
+	detectedRcFile, err := s.envManager.DetectRcFile(sshConn.Client)
+	if err != nil {
+		log.Printf("[WARN] [ENV] Failed to detect RC file: %v", err)
+		detectedRcFile = "~/.bashrc" // Default fallback
+	}
+
+	// Check for override in storage
+	rcFileOverride, err := s.storage.GetHostRcFile(payload.HostID)
+	if err != nil {
+		log.Printf("[WARN] [ENV] Failed to get RC file override: %v", err)
+	}
+
+	rcFile := detectedRcFile
+	if rcFileOverride != "" {
+		rcFile = rcFileOverride
+	}
+
+	// Read system env vars
+	systemVars, err := s.envManager.ReadSystemEnvVars(sshConn.Client)
+	if err != nil {
+		errMsg := err.Error()
+		response, _ := protocol.NewMessage(protocol.TypeEnvResult, protocol.EnvResultPayload{
+			HostID:         payload.HostID,
+			SystemVars:     []protocol.EnvVar{},
+			CustomVars:     []protocol.EnvVar{},
+			RcFile:         rcFile,
+			DetectedRcFile: detectedRcFile,
+			Error:          &errMsg,
+		})
+		return connSession.Send(response)
+	}
+
+	// Read custom env vars from RC file
+	customEnvVars, err := s.envManager.ReadCustomEnvVars(sshConn.Client, rcFile)
+	if err != nil {
+		log.Printf("[WARN] [ENV] Failed to read custom env vars: %v", err)
+		customEnvVars = []env.EnvVar{}
+	}
+
+	// Convert to protocol types
+	sysVars := make([]protocol.EnvVar, len(systemVars))
+	for i, v := range systemVars {
+		sysVars[i] = protocol.EnvVar{Key: v.Key, Value: v.Value}
+	}
+
+	custVars := make([]protocol.EnvVar, len(customEnvVars))
+	for i, v := range customEnvVars {
+		custVars[i] = protocol.EnvVar{Key: v.Key, Value: v.Value}
+	}
+
+	response, err := protocol.NewMessage(protocol.TypeEnvResult, protocol.EnvResultPayload{
+		HostID:         payload.HostID,
+		SystemVars:     sysVars,
+		CustomVars:     custVars,
+		RcFile:         rcFile,
+		DetectedRcFile: detectedRcFile,
+	})
+	if err != nil {
+		return err
+	}
+
+	log.Printf("[DEBUG] [ENV] Returning %d system vars, %d custom vars for host %s", len(sysVars), len(custVars), payload.HostID)
+	return connSession.Send(response)
+}
+
+// handleEnvUpdate updates custom env vars in the RC file
+func (s *Server) handleEnvUpdate(connSession *ConnectedSession, msg *protocol.Message) error {
+	var payload protocol.EnvUpdatePayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return err
+	}
+
+	log.Printf("[DEBUG] [ENV] Update request for host %s with %d vars", payload.HostID, len(payload.CustomVars))
+
+	// Get SSH connection
+	sshConn := s.sshManager.GetConnection(payload.HostID)
+	if sshConn == nil {
+		return connSession.SendError("NOT_CONNECTED", "Host is not connected")
+	}
+
+	// Get RC file (with override check)
+	detectedRcFile, _ := s.envManager.DetectRcFile(sshConn.Client)
+	if detectedRcFile == "" {
+		detectedRcFile = "~/.bashrc"
+	}
+
+	rcFileOverride, _ := s.storage.GetHostRcFile(payload.HostID)
+	rcFile := detectedRcFile
+	if rcFileOverride != "" {
+		rcFile = rcFileOverride
+	}
+
+	// Convert to env types
+	vars := make([]env.EnvVar, len(payload.CustomVars))
+	for i, v := range payload.CustomVars {
+		vars[i] = env.EnvVar{Key: v.Key, Value: v.Value}
+	}
+
+	// Write custom env vars
+	if err := s.envManager.WriteCustomEnvVars(sshConn.Client, rcFile, vars); err != nil {
+		errMsg := err.Error()
+		response, _ := protocol.NewMessage(protocol.TypeEnvResult, protocol.EnvResultPayload{
+			HostID:         payload.HostID,
+			SystemVars:     []protocol.EnvVar{},
+			CustomVars:     payload.CustomVars,
+			RcFile:         rcFile,
+			DetectedRcFile: detectedRcFile,
+			Error:          &errMsg,
+		})
+		return connSession.Send(response)
+	}
+
+	// Re-read system vars and return updated state
+	systemVars, _ := s.envManager.ReadSystemEnvVars(sshConn.Client)
+	sysVars := make([]protocol.EnvVar, len(systemVars))
+	for i, v := range systemVars {
+		sysVars[i] = protocol.EnvVar{Key: v.Key, Value: v.Value}
+	}
+
+	response, err := protocol.NewMessage(protocol.TypeEnvResult, protocol.EnvResultPayload{
+		HostID:         payload.HostID,
+		SystemVars:     sysVars,
+		CustomVars:     payload.CustomVars,
+		RcFile:         rcFile,
+		DetectedRcFile: detectedRcFile,
+	})
+	if err != nil {
+		return err
+	}
+
+	log.Printf("[INFO] [ENV] Updated %d custom env vars for host %s", len(payload.CustomVars), payload.HostID)
+	return connSession.Send(response)
+}
+
+// handleEnvSetRcFile saves the RC file override for a host
+func (s *Server) handleEnvSetRcFile(connSession *ConnectedSession, msg *protocol.Message) error {
+	var payload protocol.EnvSetRcFilePayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return err
+	}
+
+	log.Printf("[DEBUG] [ENV] Set RC file for host %s to %s", payload.HostID, payload.RcFile)
+
+	// Save to storage
+	if err := s.storage.SetHostRcFile(payload.HostID, payload.RcFile); err != nil {
+		return connSession.SendError("STORAGE_ERROR", err.Error())
+	}
+
+	// Return updated env list
+	return s.handleEnvList(connSession, msg)
+}
+
+// handleProcessEnvList returns env vars for a specific process
+// These env vars were captured at spawn time and stored in the process
+func (s *Server) handleProcessEnvList(connSession *ConnectedSession, msg *protocol.Message) error {
+	var payload protocol.ProcessEnvListPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return err
+	}
+
+	log.Printf("[DEBUG] [ENV] Process env list for process %s", payload.ProcessID)
+
+	// Get process
+	proc := s.processRegistry.Get(payload.ProcessID)
+	if proc == nil {
+		return connSession.SendError("PROCESS_NOT_FOUND", "Process not found")
+	}
+
+	// Return the env vars that were captured at spawn time
+	vars := make([]protocol.EnvVar, len(proc.EnvVars))
+	for i, v := range proc.EnvVars {
+		vars[i] = protocol.EnvVar{Key: v.Key, Value: v.Value}
+	}
+
+	response, err := protocol.NewMessage(protocol.TypeProcessEnvResult, protocol.ProcessEnvResultPayload{
+		ProcessID: payload.ProcessID,
+		Vars:      vars,
+	})
+	if err != nil {
+		return err
+	}
+
+	log.Printf("[DEBUG] [ENV] Returning %d env vars for process %s", len(vars), payload.ProcessID)
+	return connSession.Send(response)
+}
+
+// ============================================================================
+// Ports Scanning Handlers
+// ============================================================================
+
+func (s *Server) handlePortsScan(connSession *ConnectedSession, msg *protocol.Message) error {
+	var payload protocol.PortsScanPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return err
+	}
+
+	log.Printf("[DEBUG] [PORTS] Scanning ports for host %s", payload.HostID)
+
+	// Get SSH connection for the host
+	sshConn := s.sshManager.GetConnection(payload.HostID)
+	if sshConn == nil {
+		return connSession.SendError("NOT_CONNECTED", "Host is not connected")
+	}
+
+	// Get port scan results from the existing scanner
+	scannedProcesses, staleAgentAPIs := s.portScanner.ScanPorts(sshConn.Client, payload.HostID)
+
+	// Get network tool info for process enrichment
+	netInfo := scanner.ScanNetworkPorts(sshConn.Client, process.MinPort, process.MaxPort)
+
+	// Get process metadata from DB for mapping ports to known processes
+	var dbMetadata []storage.ProcessMetadata
+	if s.storage != nil {
+		var err error
+		dbMetadata, err = s.storage.GetProcessMetadataByHost(payload.HostID)
+		if err != nil {
+			log.Printf("[WARN] [PORTS] Failed to get process metadata from DB: %v", err)
+		}
+	}
+
+	// Build a map of port -> process metadata from DB
+	portToMetadata := make(map[int]*storage.ProcessMetadata)
+	for i := range dbMetadata {
+		if dbMetadata[i].Port > 0 {
+			portToMetadata[dbMetadata[i].Port] = &dbMetadata[i]
+		}
+	}
+
+	// Build port info list combining all sources
+	portInfoMap := make(map[int]*protocol.PortInfo)
+
+	// Add scanned active processes
+	for _, scanned := range scannedProcesses {
+		if scanned.Port == nil {
+			continue
+		}
+		port := *scanned.Port
+		portInfoMap[port] = &protocol.PortInfo{
+			Port:   port,
+			Status: "active",
+		}
+	}
+
+	// Add stale processes
+	for _, stale := range staleAgentAPIs {
+		if stale.Port == 0 {
+			continue
+		}
+		if _, exists := portInfoMap[stale.Port]; !exists {
+			portInfoMap[stale.Port] = &protocol.PortInfo{
+				Port:   stale.Port,
+				Status: stale.Reason,
+			}
+		}
+	}
+
+	// Enrich with DB metadata
+	for port, info := range portInfoMap {
+		if meta, ok := portToMetadata[port]; ok {
+			info.ProcessID = &meta.ProcessID
+			info.ProcessName = nilIfEmpty(meta.Name)
+			procType := protocol.ProcessType(meta.ProcessType)
+			info.ProcessType = &procType
+		}
+	}
+
+	// Enrich with network tool info
+	for port, info := range portInfoMap {
+		if netResult := netInfo.GetNetToolResultForPort(port); netResult != nil {
+			if netResult.PID > 0 {
+				info.NetPID = &netResult.PID
+			}
+			if netResult.Process != "" {
+				info.NetProcess = &netResult.Process
+			}
+			if netResult.User != "" {
+				info.NetUser = &netResult.User
+			}
+		}
+	}
+
+	// Convert map to slice
+	var ports []protocol.PortInfo
+	for _, info := range portInfoMap {
+		ports = append(ports, *info)
+	}
+
+	// Build response
+	result := protocol.PortsResultPayload{
+		HostID: payload.HostID,
+		Ports:  ports,
+	}
+
+	if netInfo.Tool != "" {
+		result.NetTool = &netInfo.Tool
+	}
+	if netInfo.Error != "" {
+		result.NetToolError = &netInfo.Error
+	}
+
+	response, err := protocol.NewMessage(protocol.TypePortsResult, result)
+	if err != nil {
+		return err
+	}
+
+	log.Printf("[DEBUG] [PORTS] Found %d ports (netTool=%s)", len(ports), netInfo.Tool)
+	return connSession.Send(response)
+}
+
+// nilIfEmpty returns nil if the string is empty, otherwise returns a pointer to it
+func nilIfEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+// ============================================================================
+// Snippet Handlers
+// ============================================================================
+
+// handleSnippetList returns all stored snippets
+func (s *Server) handleSnippetList(connSession *ConnectedSession, msg *protocol.Message) error {
+	log.Printf("[DEBUG] [SNIPPETS] Listing all snippets")
+
+	snippets, err := s.storage.ListSnippets()
+	if err != nil {
+		log.Printf("[ERROR] [SNIPPETS] Failed to list snippets: %v", err)
+		return connSession.SendError("STORAGE_ERROR", err.Error())
+	}
+
+	// Convert storage snippets to protocol snippets
+	protoSnippets := make([]protocol.Snippet, len(snippets))
+	for i, snippet := range snippets {
+		protoSnippets[i] = protocol.Snippet{
+			ID:        snippet.ID,
+			Name:      snippet.Name,
+			Content:   snippet.Content,
+			CreatedAt: snippet.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+			UpdatedAt: snippet.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		}
+	}
+
+	response, err := protocol.NewMessage(protocol.TypeSnippetListResult, protocol.SnippetListResultPayload{
+		Snippets: protoSnippets,
+	})
+	if err != nil {
+		return err
+	}
+
+	log.Printf("[DEBUG] [SNIPPETS] Returning %d snippets", len(protoSnippets))
+	return connSession.Send(response)
+}
+
+// handleSnippetCreate creates a new snippet
+func (s *Server) handleSnippetCreate(connSession *ConnectedSession, msg *protocol.Message) error {
+	var payload protocol.SnippetCreatePayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return err
+	}
+
+	log.Printf("[DEBUG] [SNIPPETS] Creating snippet: %s", payload.Name)
+
+	// Validate input
+	if payload.Name == "" {
+		errMsg := "snippet name is required"
+		response, _ := protocol.NewMessage(protocol.TypeSnippetCreateResult, protocol.SnippetCreateResultPayload{
+			Success: false,
+			Error:   &errMsg,
+		})
+		return connSession.Send(response)
+	}
+
+	// Create snippet
+	snippet := storage.Snippet{
+		ID:      uuid.New().String(),
+		Name:    payload.Name,
+		Content: payload.Content,
+	}
+
+	if err := s.storage.CreateSnippet(snippet); err != nil {
+		log.Printf("[ERROR] [SNIPPETS] Failed to create snippet: %v", err)
+		errMsg := err.Error()
+		response, _ := protocol.NewMessage(protocol.TypeSnippetCreateResult, protocol.SnippetCreateResultPayload{
+			Success: false,
+			Error:   &errMsg,
+		})
+		return connSession.Send(response)
+	}
+
+	// Get the created snippet back (to get timestamps)
+	created, err := s.storage.GetSnippet(snippet.ID)
+	if err != nil || created == nil {
+		log.Printf("[ERROR] [SNIPPETS] Failed to get created snippet: %v", err)
+		errMsg := "snippet created but failed to retrieve"
+		response, _ := protocol.NewMessage(protocol.TypeSnippetCreateResult, protocol.SnippetCreateResultPayload{
+			Success: false,
+			Error:   &errMsg,
+		})
+		return connSession.Send(response)
+	}
+
+	protoSnippet := protocol.Snippet{
+		ID:        created.ID,
+		Name:      created.Name,
+		Content:   created.Content,
+		CreatedAt: created.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		UpdatedAt: created.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
+	}
+
+	response, err := protocol.NewMessage(protocol.TypeSnippetCreateResult, protocol.SnippetCreateResultPayload{
+		Success: true,
+		Snippet: &protoSnippet,
+	})
+	if err != nil {
+		return err
+	}
+
+	log.Printf("[DEBUG] [SNIPPETS] Created snippet %s", snippet.ID)
+	return connSession.Send(response)
+}
+
+// handleSnippetUpdate updates an existing snippet
+func (s *Server) handleSnippetUpdate(connSession *ConnectedSession, msg *protocol.Message) error {
+	var payload protocol.SnippetUpdatePayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return err
+	}
+
+	log.Printf("[DEBUG] [SNIPPETS] Updating snippet: %s", payload.ID)
+
+	// Get existing snippet
+	existing, err := s.storage.GetSnippet(payload.ID)
+	if err != nil {
+		log.Printf("[ERROR] [SNIPPETS] Failed to get snippet: %v", err)
+		errMsg := err.Error()
+		response, _ := protocol.NewMessage(protocol.TypeSnippetUpdateResult, protocol.SnippetUpdateResultPayload{
+			Success: false,
+			Error:   &errMsg,
+		})
+		return connSession.Send(response)
+	}
+	if existing == nil {
+		errMsg := "snippet not found"
+		response, _ := protocol.NewMessage(protocol.TypeSnippetUpdateResult, protocol.SnippetUpdateResultPayload{
+			Success: false,
+			Error:   &errMsg,
+		})
+		return connSession.Send(response)
+	}
+
+	// Update fields if provided
+	if payload.Name != nil {
+		existing.Name = *payload.Name
+	}
+	if payload.Content != nil {
+		existing.Content = *payload.Content
+	}
+
+	if err := s.storage.UpdateSnippet(*existing); err != nil {
+		log.Printf("[ERROR] [SNIPPETS] Failed to update snippet: %v", err)
+		errMsg := err.Error()
+		response, _ := protocol.NewMessage(protocol.TypeSnippetUpdateResult, protocol.SnippetUpdateResultPayload{
+			Success: false,
+			Error:   &errMsg,
+		})
+		return connSession.Send(response)
+	}
+
+	// Get the updated snippet back
+	updated, err := s.storage.GetSnippet(payload.ID)
+	if err != nil || updated == nil {
+		log.Printf("[ERROR] [SNIPPETS] Failed to get updated snippet: %v", err)
+		errMsg := "snippet updated but failed to retrieve"
+		response, _ := protocol.NewMessage(protocol.TypeSnippetUpdateResult, protocol.SnippetUpdateResultPayload{
+			Success: false,
+			Error:   &errMsg,
+		})
+		return connSession.Send(response)
+	}
+
+	protoSnippet := protocol.Snippet{
+		ID:        updated.ID,
+		Name:      updated.Name,
+		Content:   updated.Content,
+		CreatedAt: updated.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		UpdatedAt: updated.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
+	}
+
+	response, err := protocol.NewMessage(protocol.TypeSnippetUpdateResult, protocol.SnippetUpdateResultPayload{
+		Success: true,
+		Snippet: &protoSnippet,
+	})
+	if err != nil {
+		return err
+	}
+
+	log.Printf("[DEBUG] [SNIPPETS] Updated snippet %s", payload.ID)
+	return connSession.Send(response)
+}
+
+// handleSnippetDelete deletes a snippet
+func (s *Server) handleSnippetDelete(connSession *ConnectedSession, msg *protocol.Message) error {
+	var payload protocol.SnippetDeletePayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return err
+	}
+
+	log.Printf("[DEBUG] [SNIPPETS] Deleting snippet: %s", payload.ID)
+
+	// Check if snippet exists
+	existing, err := s.storage.GetSnippet(payload.ID)
+	if err != nil {
+		log.Printf("[ERROR] [SNIPPETS] Failed to get snippet: %v", err)
+		errMsg := err.Error()
+		response, _ := protocol.NewMessage(protocol.TypeSnippetDeleteResult, protocol.SnippetDeleteResultPayload{
+			Success: false,
+			Error:   &errMsg,
+		})
+		return connSession.Send(response)
+	}
+	if existing == nil {
+		errMsg := "snippet not found"
+		response, _ := protocol.NewMessage(protocol.TypeSnippetDeleteResult, protocol.SnippetDeleteResultPayload{
+			Success: false,
+			Error:   &errMsg,
+		})
+		return connSession.Send(response)
+	}
+
+	if err := s.storage.DeleteSnippet(payload.ID); err != nil {
+		log.Printf("[ERROR] [SNIPPETS] Failed to delete snippet: %v", err)
+		errMsg := err.Error()
+		response, _ := protocol.NewMessage(protocol.TypeSnippetDeleteResult, protocol.SnippetDeleteResultPayload{
+			Success: false,
+			Error:   &errMsg,
+		})
+		return connSession.Send(response)
+	}
+
+	id := payload.ID
+	response, err := protocol.NewMessage(protocol.TypeSnippetDeleteResult, protocol.SnippetDeleteResultPayload{
+		Success: true,
+		ID:      &id,
+	})
+	if err != nil {
+		return err
+	}
+
+	log.Printf("[DEBUG] [SNIPPETS] Deleted snippet %s", payload.ID)
+	return connSession.Send(response)
 }

@@ -56,11 +56,15 @@ func (m *Manager) Connect(hostID, host string, port int, username string, auth A
 	// Check if connection already exists
 	if existingConn := m.GetConnection(hostID); existingConn != nil {
 		if existingConn.connected {
-			log.Printf("[DEBUG] [SSH] Reusing existing connection for hostID=%s", hostID)
-			existingConn.lastUsed = time.Now()
-			return existingConn, nil
+			// Verify the connection is actually alive by creating a test session
+			if existingConn.IsAlive() {
+				log.Printf("[DEBUG] [SSH] Reusing existing connection for hostID=%s", hostID)
+				existingConn.lastUsed = time.Now()
+				return existingConn, nil
+			}
+			log.Printf("[WARN] [SSH] Existing connection for hostID=%s is dead, reconnecting", hostID)
 		}
-		// Connection exists but is disconnected, remove it
+		// Connection exists but is disconnected or dead, remove it
 		m.removeConnection(hostID)
 	}
 
@@ -180,6 +184,25 @@ func (m *Manager) keepAlive(conn *Connection) {
 			return
 		}
 	}
+}
+
+// IsAlive checks if the SSH connection is still alive by sending a test request
+func (c *Connection) IsAlive() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.Client == nil || !c.connected {
+		return false
+	}
+
+	// Try to send a keepalive request - if it fails, connection is dead
+	_, _, err := c.Client.SendRequest("keepalive@openssh.com", true, nil)
+	if err != nil {
+		log.Printf("[DEBUG] [SSH] Connection %s is not alive: %v", c.ID, err)
+		return false
+	}
+
+	return true
 }
 
 // GetConnection retrieves an existing connection by host ID
